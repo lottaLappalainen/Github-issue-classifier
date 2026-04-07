@@ -1,45 +1,58 @@
 """
-featurize.py — Gold Layer
-Reads clean Silver CSV, engineers TF-IDF features,
-balances classes, splits train/test, and saves Gold artifacts.
+src/data/featurize.py  —  Gold Layer
+Reads clean Silver parquet, combines text, balances classes,
+splits train/test, and saves Gold artifacts as parquet.
+
+Outputs:
+    data/gold/train.parquet  — columns: text, priority
+    data/gold/test.parquet   — columns: text, priority
+    data/gold/meta.json      — dataset statistics
+
+Usage:
+    python src/data/featurize.py
+    python src/data/featurize.py --silver-path data/silver/issues_clean.parquet
 """
+import json
+import logging
+import argparse
+from pathlib import Path
 
 import pandas as pd
-import numpy as np
-import joblib
-from pathlib import Path
 from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder
 from sklearn.utils import resample
 
-SILVER_FILE = Path("data/silver/issues_clean.csv")
-GOLD_DIR    = Path("data/gold")
+# ── paths ──────────────────────────────────────────────────────────────────
+ROOT        = Path(__file__).resolve().parents[2]
+SILVER_PATH = ROOT / "data" / "silver" / "issues_clean.parquet"
+GOLD_DIR    = ROOT / "data" / "gold"
+GOLD_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
 
 TEST_SIZE    = 0.2
 RANDOM_STATE = 42
-MAX_FEATURES = 5000   # TF-IDF vocabulary size
 
 
-# ── Text combination ───────────────────────────────────────────────────────────
+# ── public helpers (importable by tests) ───────────────────────────────────
 
 def combine_text(df: pd.DataFrame) -> pd.Series:
     """
     Combine title + body into a single text field.
     Title is repeated 3x to give it more weight than body.
     """
-    return df["title"] * 3 + " " + df["body"].fillna("")
+    title = df["title"].fillna("").str.strip()
+    body  = df["body"].fillna("").str.strip()
+    return (title + " " + title + " " + title + " " + body).str.strip()
 
 
-# ── Class balancing ────────────────────────────────────────────────────────────
-
-def balance_classes(df: pd.DataFrame) -> pd.DataFrame:
+def balance_classes(df: pd.DataFrame, random_state: int = RANDOM_STATE) -> pd.DataFrame:
     """
-    Upsample minority classes to match the majority class.
-    This prevents the model from just predicting 'low' for everything.
+    Upsample minority classes to match the majority class size.
+    Prevents the model from just predicting the dominant class.
     """
     max_count = df["priority"].value_counts().max()
-    balanced_parts = []
+    parts = []
 
     for priority in df["priority"].unique():
         subset = df[df["priority"] == priority]
@@ -48,87 +61,95 @@ def balance_classes(df: pd.DataFrame) -> pd.DataFrame:
                 subset,
                 replace=True,
                 n_samples=max_count,
-                random_state=RANDOM_STATE,
+                random_state=random_state,
             )
-        balanced_parts.append(subset)
+        parts.append(subset)
 
-    return pd.concat(balanced_parts).sample(frac=1, random_state=RANDOM_STATE)
+    return pd.concat(parts).sample(frac=1, random_state=random_state).reset_index(drop=True)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def featurize(df: pd.DataFrame, test_size: float = TEST_SIZE) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Silver → Gold transformation.
+    Returns (train_df, test_df) each with columns: text, priority
+    """
+    log.info(f"  input rows: {len(df):,}")
+    log.info(f"  class distribution (before balance):\n{df['priority'].value_counts().to_string()}")
 
-def main():
-    print("🔄 Starting Gold featurization...")
-
-    df = pd.read_csv(SILVER_FILE)
-    print(f"  Loaded {len(df)} issues from Silver")
-
-    # Combine text
+    # 1. Combine text fields
+    df = df.copy()
     df["text"] = combine_text(df)
 
-    # Balance classes
-    df_balanced = balance_classes(df)
-    print(f"  After balancing: {len(df_balanced)} issues")
-    print(f"  Class distribution: {df_balanced['priority'].value_counts().to_dict()}")
+    # 2. Drop rows where text is empty after combining
+    df = df[df["text"].str.len() > 0]
+    log.info(f"  after dropping empty text: {len(df):,}")
 
-    # Encode labels: high=0, medium=1, low=2
-    le = LabelEncoder()
-    le.fit(["high", "medium", "low"])
-    df_balanced["label"] = le.transform(df_balanced["priority"])
+    # 3. Balance classes
+    df_balanced = balance_classes(df[["text", "priority"]])
+    log.info(f"  after balancing: {len(df_balanced):,}")
+    log.info(f"  class distribution (after balance):\n{df_balanced['priority'].value_counts().to_string()}")
 
-    # Train / test split
-    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
-        df_balanced["text"],
-        df_balanced["label"],
-        test_size=TEST_SIZE,
+    # 4. Train / test split (stratified)
+    train_df, test_df = train_test_split(
+        df_balanced,
+        test_size=test_size,
         random_state=RANDOM_STATE,
-        stratify=df_balanced["label"],
+        stratify=df_balanced["priority"],
     )
 
-    # TF-IDF vectorization
-    # Fit ONLY on training data to prevent data leakage
-    vectorizer = TfidfVectorizer(
-        max_features=MAX_FEATURES,
-        ngram_range=(1, 2),     # unigrams + bigrams
-        sublinear_tf=True,      # apply log normalization
-        strip_accents="unicode",
-        analyzer="word",
-        min_df=2,               # ignore very rare terms
-    )
+    log.info(f"  train: {len(train_df):,} | test: {len(test_df):,}")
+    return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
-    X_train = vectorizer.fit_transform(X_train_raw)
-    X_test  = vectorizer.transform(X_test_raw)
 
-    print(f"  Feature matrix: {X_train.shape[1]} TF-IDF features")
+def save_gold(train_df: pd.DataFrame, test_df: pd.DataFrame, gold_dir: Path) -> None:
+    """Save Gold train/test splits and metadata."""
+    gold_dir = Path(gold_dir)
+    gold_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save Gold artifacts
-    GOLD_DIR.mkdir(parents=True, exist_ok=True)
+    train_path = gold_dir / "train.parquet"
+    test_path  = gold_dir / "test.parquet"
 
-    joblib.dump(X_train,    GOLD_DIR / "X_train.joblib")
-    joblib.dump(X_test,     GOLD_DIR / "X_test.joblib")
-    joblib.dump(y_train,    GOLD_DIR / "y_train.joblib")
-    joblib.dump(y_test,     GOLD_DIR / "y_test.joblib")
-    joblib.dump(vectorizer, GOLD_DIR / "vectorizer.joblib")
-    joblib.dump(le,         GOLD_DIR / "label_encoder.joblib")
+    train_df.to_parquet(train_path, index=False)
+    test_df.to_parquet(test_path, index=False)
+    log.info(f"  saved train → {train_path}")
+    log.info(f"  saved test  → {test_path}")
 
-    # Also save a small metadata file for reference
+    # Write metadata for DVC / MLflow lineage
     meta = {
-        "n_train":       int(X_train.shape[0]),
-        "n_test":        int(X_test.shape[0]),
-        "n_features":    int(X_train.shape[1]),
-        "classes":       list(le.classes_),
-        "class_distribution": df_balanced["priority"].value_counts().to_dict(),
+        "n_train":            len(train_df),
+        "n_test":             len(test_df),
+        "class_distribution": train_df["priority"].value_counts().to_dict(),
+        "test_size":          TEST_SIZE,
+        "columns":            list(train_df.columns),
     }
-    import json
-    with open(GOLD_DIR / "meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
+    meta_path = gold_dir / "meta.json"
+    meta_path.write_text(json.dumps(meta, indent=2))
+    log.info(f"  saved meta  → {meta_path}")
 
-    print()
-    print(f"✅ Gold featurization complete.")
-    print(f"   Train: {X_train.shape[0]} samples")
-    print(f"   Test:  {X_test.shape[0]} samples")
-    print(f"   Output: {GOLD_DIR.resolve()}")
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+def main(silver_path: Path, gold_dir: Path) -> None:
+    log.info("=== Gold Layer: Featurization ===")
+
+    if not silver_path.exists():
+        raise FileNotFoundError(
+            f"Silver file not found: {silver_path}\nRun clean.py first."
+        )
+
+    df = pd.read_parquet(silver_path)
+    log.info(f"Loaded {len(df):,} rows from Silver")
+
+    train_df, test_df = featurize(df)
+    save_gold(train_df, test_df, gold_dir)
+
+    log.info(f"\nDone. Gold data saved to {gold_dir.resolve()}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Featurize Silver → Gold layer")
+    parser.add_argument("--silver-path", type=Path, default=SILVER_PATH)
+    parser.add_argument("--gold-dir",    type=Path, default=GOLD_DIR)
+    args = parser.parse_args()
+
+    main(silver_path=args.silver_path, gold_dir=args.gold_dir)

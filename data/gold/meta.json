@@ -1,0 +1,14 @@
+{
+  "n_train": 364,
+  "n_test": 92,
+  "class_distribution": {
+    "high": 122,
+    "low": 121,
+    "medium": 121
+  },
+  "test_size": 0.2,
+  "columns": [
+    "text",
+    "priority"
+  ]
+}

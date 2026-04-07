@@ -1,0 +1,56 @@
+stages:
+  ingest:
+    cmd: python src/data/ingest.py
+    deps:
+      - src/data/ingest.py
+    outs:
+      - data/bronze/issues_raw.parquet
+    always_changed: true   # re-run on every dvc repro (live API)
+
+  clean:
+    cmd: python src/data/clean.py
+    deps:
+      - src/data/clean.py
+      - data/bronze/issues_raw.parquet
+    outs:
+      - data/silver/issues_clean.parquet
+
+  featurize:
+    cmd: python src/data/featurize.py
+    deps:
+      - src/data/featurize.py
+      - data/silver/issues_clean.parquet
+    outs:
+      - data/gold/train.parquet
+      - data/gold/test.parquet
+      - data/gold/meta.json
+    params:
+      - params.yaml:
+          - featurize.test_size
+
+  train:
+    cmd: python src/models/train.py
+    deps:
+      - src/models/train.py
+      - data/gold/train.parquet
+      - data/gold/test.parquet
+    outs:
+      - models/best_model.joblib
+    metrics:
+      - metrics.json:
+          cache: false
+    params:
+      - params.yaml:
+          - train.max_features
+          - train.ngram_range
+          - train.C
+
+  evaluate:
+    cmd: python src/models/evaluate.py --output data/predictions.csv
+    deps:
+      - src/models/evaluate.py
+      - models/best_model.joblib
+      - data/gold/test.parquet
+    outs:
+      - data/predictions.csv:
+          cache: false
