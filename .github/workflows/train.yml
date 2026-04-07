@@ -5,7 +5,6 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main]
-  # Also run when data files change (DVC tracked)
   workflow_dispatch:
     inputs:
       retrain:
@@ -43,9 +42,7 @@ jobs:
 
       - name: Lint with flake8
         run: |
-          # Stop on syntax errors or undefined names
           flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Warn on style issues (don't fail)
           flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
 
       - name: Run unit tests with coverage
@@ -85,18 +82,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install dvc
 
-      - name: Set up DVC
-        run: |
-          pip install dvc dvc-gdrive
-          dvc --version
+      - name: Verify DVC
+        run: dvc --version
 
       - name: Fetch GitHub issues (Bronze layer)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python src/data/ingest.py
-        continue-on-error: false
+        run: python src/data/ingest.py
 
       - name: Clean data (Silver layer)
         run: python src/data/clean.py
@@ -107,15 +101,8 @@ jobs:
       - name: Train models and log to MLflow
         run: python src/models/train.py
 
-      - name: Run inference on test.csv
-        run: |
-          if [ -f "data/test.csv" ]; then
-            python src/models/evaluate.py --input data/test.csv --output data/predictions.csv
-            echo "=== Predictions Preview ==="
-            head -20 data/predictions.csv
-          else
-            echo "No test.csv found — skipping production inference step"
-          fi
+      - name: Evaluate model
+        run: python src/models/evaluate.py --output data/predictions.csv
 
       - name: Check model quality gate
         run: |
@@ -123,7 +110,6 @@ jobs:
           import json, sys
           from pathlib import Path
 
-          # Load the latest run metrics
           metrics_file = Path("metrics.json")
           if not metrics_file.exists():
               print("No metrics.json found — skipping quality gate")
@@ -162,8 +148,15 @@ jobs:
           path: models/best_model.joblib
           if-no-files-found: warn
 
+      - name: Upload metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics
+          path: metrics.json
+          if-no-files-found: ignore
+
   # ─────────────────────────────────────────────
-  # JOB 3: Build & push Docker image (main only, after train passes)
+  # JOB 3: Build Docker image (main only, after train passes)
   # ─────────────────────────────────────────────
   docker:
     name: Build Docker Image
@@ -180,6 +173,13 @@ jobs:
         with:
           name: trained-model
           path: models/
+
+      - name: Download metrics
+        uses: actions/download-artifact@v4
+        with:
+          name: metrics
+          path: .
+        continue-on-error: true   
 
       - name: Build Docker image
         run: |

@@ -26,7 +26,6 @@ ENV/
 env.bak/
 venv.bak/
 
-
 data/bronze/
 data/silver/
 data/gold/
@@ -46,9 +45,6 @@ models/*.bin
 mlruns/
 mlflow.db
 mlartifacts/
-
-metrics.json
-
 
 .dvc/cache/
 .dvc/tmp/
@@ -84,3 +80,5 @@ $RECYCLE.BIN/
 
 *.log
 logs/
+
+data/predictions.csv

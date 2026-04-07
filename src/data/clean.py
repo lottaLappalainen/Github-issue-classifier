@@ -22,11 +22,13 @@ log = logging.getLogger(__name__)
 
 # ── label maps ─────────────────────────────────────────────────────────────
 HIGH_KEYWORDS   = {"bug", "critical", "crash", "priority:high", "severity:high",
-                   "security", "regression", "blocker", "urgent"}
+                   "security",
+    "p0", "p1", "pri0", "pri1", "regression", "blocker", "urgent"}
 MEDIUM_KEYWORDS = {"enhancement", "feature", "feature-request", "priority:medium",
-                   "improvement", "performance", "request"}
+                   "improvement", "performance",
+    "p2", "pri2", "request"}
 LOW_KEYWORDS    = {"documentation", "docs", "good first issue", "help wanted",
-                   "priority:low", "question", "wontfix", "duplicate"}
+                   "priority:low", "question", "wontfix", "p3", "p4", "duplicate"}
 
 
 # ── public helpers (imported by tests) ─────────────────────────────────────
