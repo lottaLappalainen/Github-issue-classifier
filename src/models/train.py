@@ -1,174 +1,184 @@
 """
-train.py — Model Training
-Trains multiple classifiers, logs everything to MLflow,
-and registers the best model.
-"""
+src/models/train.py  —  Model Training + MLflow Logging
+Trains 3 classifiers on Gold data, logs to MLflow, saves the best model.
 
+Usage:
+    python src/models/train.py
+    python src/models/train.py --gold-version v2
+"""
 import json
+import logging
+import argparse
+from pathlib import Path
+from typing import Optional
+
 import joblib
 import mlflow
 import mlflow.sklearn
+import pandas as pd
 import numpy as np
-from pathlib import Path
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.metrics import (
-    classification_report,
-    f1_score,
-    precision_score,
-    recall_score,
-    accuracy_score,
-)
+from sklearn.metrics import f1_score, accuracy_score, classification_report
+from sklearn.model_selection import cross_val_score
 
-GOLD_DIR    = Path("data/gold")
-MODEL_DIR   = Path("models")
-PARAMS_FILE = Path("params.yaml")
+# ── paths ──────────────────────────────────────────────────────────────────
+ROOT       = Path(__file__).resolve().parents[2]
+GOLD_DIR   = ROOT / "data" / "gold"
+MODELS_DIR = ROOT / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-MLFLOW_EXPERIMENT = "github-issue-priority"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
 
-
-# ── Load Gold data ─────────────────────────────────────────────────────────────
-
-def load_gold():
-    X_train = joblib.load(GOLD_DIR / "X_train.joblib")
-    X_test  = joblib.load(GOLD_DIR / "X_test.joblib")
-    y_train = joblib.load(GOLD_DIR / "y_train.joblib")
-    y_test  = joblib.load(GOLD_DIR / "y_test.joblib")
-    le      = joblib.load(GOLD_DIR / "label_encoder.joblib")
-
-    with open(GOLD_DIR / "meta.json") as f:
-        meta = json.load(f)
-
-    return X_train, X_test, y_train, y_test, le, meta
+LABEL_ORDER = ["high", "medium", "low"]
 
 
-# ── Models to try ─────────────────────────────────────────────────────────────
-# We train all three and MLflow tracks them.
-# The best F1 (macro) wins and gets registered.
+# ── public helpers (imported by tests) ─────────────────────────────────────
 
-MODELS = {
-    "logistic_regression": LogisticRegression(
-        max_iter=1000,
-        C=1.0,
-        solver="lbfgs",
-        multi_class="multinomial",
-        random_state=42,
-    ),
-    "random_forest": RandomForestClassifier(
-        n_estimators=100,
-        max_depth=20,
-        random_state=42,
-        n_jobs=-1,
-    ),
-    "gradient_boosting": GradientBoostingClassifier(
-        n_estimators=100,
-        max_depth=5,
-        random_state=42,
-    ),
-}
+def build_pipeline(
+    classifier: str = "logistic_regression",
+    max_features: int = 10_000,
+    ngram_range: tuple = (1, 2),
+    C: float = 1.0,
+    n_estimators: int = 100,
+) -> Pipeline:
+    """
+    Build a sklearn Pipeline with TF-IDF + classifier.
+    classifier: one of 'logistic_regression', 'random_forest', 'gradient_boosting'
+    """
+    tfidf = TfidfVectorizer(
+        max_features=max_features,
+        ngram_range=ngram_range,
+        sublinear_tf=True,
+        strip_accents="unicode",
+        analyzer="word",
+        token_pattern=r"\w{2,}",
+        min_df=2,
+    )
 
+    if classifier == "logistic_regression":
+        clf = LogisticRegression(C=C, max_iter=1000, class_weight="balanced",
+                                 solver="lbfgs")
+    elif classifier == "random_forest":
+        clf = RandomForestClassifier(n_estimators=n_estimators, class_weight="balanced",
+                                     random_state=42, n_jobs=-1)
+    elif classifier == "gradient_boosting":
+        clf = GradientBoostingClassifier(n_estimators=n_estimators, random_state=42)
+    else:
+        raise ValueError(f"Unknown classifier: {classifier}")
 
-# ── Train + log one model ──────────────────────────────────────────────────────
-
-def train_and_log(name, model, X_train, X_test, y_train, y_test, le, meta):
-    with mlflow.start_run(run_name=name):
-
-        # Log params
-        mlflow.log_param("model_type",  name)
-        mlflow.log_param("n_train",     meta["n_train"])
-        mlflow.log_param("n_test",      meta["n_test"])
-        mlflow.log_param("n_features",  meta["n_features"])
-        mlflow.log_params(model.get_params())
-
-        # Train
-        print(f"  Training {name}...")
-        model.fit(X_train, y_train)
-
-        # Evaluate
-        y_pred = model.predict(X_test)
-
-        f1        = f1_score(y_test, y_pred, average="macro")
-        precision = precision_score(y_test, y_pred, average="macro", zero_division=0)
-        recall    = recall_score(y_test, y_pred, average="macro", zero_division=0)
-        accuracy  = accuracy_score(y_test, y_pred)
-
-        # Log metrics
-        mlflow.log_metric("f1_macro",   f1)
-        mlflow.log_metric("precision",  precision)
-        mlflow.log_metric("recall",     recall)
-        mlflow.log_metric("accuracy",   accuracy)
-
-        # Per-class metrics
-        report = classification_report(
-            y_test, y_pred,
-            target_names=le.classes_,
-            output_dict=True,
-        )
-        for cls in le.classes_:
-            mlflow.log_metric(f"f1_{cls}",        report[cls]["f1-score"])
-            mlflow.log_metric(f"precision_{cls}", report[cls]["precision"])
-            mlflow.log_metric(f"recall_{cls}",    report[cls]["recall"])
-
-        # Log model artifact
-        mlflow.sklearn.log_model(model, artifact_path="model")
-
-        # Print summary
-        print(f"    F1 (macro): {f1:.4f}  |  Accuracy: {accuracy:.4f}")
-        print(f"    {classification_report(y_test, y_pred, target_names=le.classes_)}")
-
-        return mlflow.active_run().info.run_id, f1
+    return Pipeline([("tfidf", tfidf), ("clf", clf)])
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def train_model(pipeline: Pipeline, X: pd.Series, y: pd.Series) -> Pipeline:
+    """Fit the pipeline and return the fitted estimator."""
+    pipeline.fit(X, y)
+    return pipeline
 
-def main():
-    print("🔄 Starting model training...")
-    print()
 
-    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+def compute_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict:
+    """Return a dict with f1_macro and accuracy (primary KPIs)."""
+    return {
+        "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "f1_high":   float(f1_score(y_true, y_pred, labels=["high"],   average="macro", zero_division=0)),
+        "f1_medium": float(f1_score(y_true, y_pred, labels=["medium"], average="macro", zero_division=0)),
+        "f1_low":    float(f1_score(y_true, y_pred, labels=["low"],    average="macro", zero_division=0)),
+    }
 
-    X_train, X_test, y_train, y_test, le, meta = load_gold()
 
-    results = []
-    for name, model in MODELS.items():
-        run_id, f1 = train_and_log(
-            name, model,
-            X_train, X_test,
-            y_train, y_test,
-            le, meta,
-        )
-        results.append((name, run_id, f1))
+# ── main training loop ─────────────────────────────────────────────────────
 
-    # Find the best model
-    best_name, best_run_id, best_f1 = max(results, key=lambda x: x[2])
+def run_training(gold_version: Optional[str] = None) -> None:
+    log.info("=== Model Training ===")
 
-    print()
-    print("📊 Results summary:")
-    for name, _, f1 in sorted(results, key=lambda x: -x[2]):
-        marker = " ← best" if name == best_name else ""
-        print(f"   {name:30s}: F1={f1:.4f}{marker}")
+    # Load Gold data
+    train_path = GOLD_DIR / "train.parquet"
+    test_path  = GOLD_DIR / "test.parquet"
 
-    # Save best model locally for serving
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    best_model = MODELS[best_name]
+    if not train_path.exists():
+        raise FileNotFoundError(f"Gold train set not found: {train_path}\nRun featurize.py first.")
 
-    joblib.dump(best_model,                             MODEL_DIR / "model.joblib")
-    joblib.dump(joblib.load(GOLD_DIR / "vectorizer.joblib"), MODEL_DIR / "vectorizer.joblib")
-    joblib.dump(joblib.load(GOLD_DIR / "label_encoder.joblib"), MODEL_DIR / "label_encoder.joblib")
+    train_df = pd.read_parquet(train_path)
+    test_df  = pd.read_parquet(test_path)
+    log.info(f"Train: {len(train_df):,} | Test: {len(test_df):,}")
 
-    # Save best model metadata
-    with open(MODEL_DIR / "meta.json", "w") as f:
-        json.dump({
-            "best_model":  best_name,
-            "best_run_id": best_run_id,
-            "f1_macro":    best_f1,
-        }, f, indent=2)
+    X_train, y_train = train_df["text"], train_df["priority"]
+    X_test,  y_test  = test_df["text"],  test_df["priority"]
 
-    print()
-    print(f"✅ Training complete. Best model: {best_name} (F1={best_f1:.4f})")
-    print(f"   Saved to {MODEL_DIR.resolve()}")
-    print(f"   MLflow UI: run `mlflow ui` to explore experiments")
+    # Experiment setup
+    mlflow.set_experiment("github-issue-priority")
+    data_version = gold_version or "v1"
+
+    configs = [
+        {"classifier": "logistic_regression", "C": 0.5,  "max_features": 5_000},
+        {"classifier": "logistic_regression", "C": 1.0,  "max_features": 10_000},
+        {"classifier": "random_forest",       "n_estimators": 100, "max_features": 10_000},
+    ]
+
+    best_f1    = -1.0
+    best_model = None
+    best_run_id = None
+
+    for cfg in configs:
+        clf_name = cfg["classifier"]
+        log.info(f"\nTraining: {clf_name} | config: {cfg}")
+
+        with mlflow.start_run(run_name=f"{clf_name}__{data_version}") as run:
+            # Log data version (links model ↔ data — required by assignment)
+            mlflow.set_tag("data_version", data_version)
+            mlflow.set_tag("classifier",   clf_name)
+            mlflow.log_params(cfg)
+
+            pipeline = build_pipeline(**cfg)
+            trained  = train_model(pipeline, X_train, y_train)
+
+            # Cross-validation on train set (secondary KPI: stability)
+            cv_scores = cross_val_score(
+                build_pipeline(**cfg), X_train, y_train,
+                cv=3, scoring="f1_macro", n_jobs=-1
+            )
+            mlflow.log_metric("cv_f1_macro_mean", float(cv_scores.mean()))
+            mlflow.log_metric("cv_f1_macro_std",  float(cv_scores.std()))
+
+            # Test set metrics (primary KPIs)
+            preds   = trained.predict(X_test)
+            metrics = compute_metrics(y_test, preds)
+            mlflow.log_metrics(metrics)
+
+            # Full classification report as artifact
+            report = classification_report(y_test, preds, labels=LABEL_ORDER, zero_division=0)
+            report_path = MODELS_DIR / f"report_{clf_name}.txt"
+            report_path.write_text(report)
+            mlflow.log_artifact(str(report_path))
+
+            log.info(f"  F1 macro: {metrics['f1_macro']:.4f}  accuracy: {metrics['accuracy']:.4f}")
+            log.info(f"  CV F1: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+
+            # Log model to MLflow registry
+            mlflow.sklearn.log_model(trained, artifact_path="model")
+
+            if metrics["f1_macro"] > best_f1:
+                best_f1    = metrics["f1_macro"]
+                best_model = trained
+                best_run_id = run.info.run_id
+
+    # Save best model locally
+    best_path = MODELS_DIR / "best_model.joblib"
+    joblib.dump(best_model, best_path)
+    log.info(f"\nBest model saved → {best_path}  (F1={best_f1:.4f}, run={best_run_id})")
+
+    # Write metrics.json for CI/CD quality gate
+    metrics_out = {"f1_macro": best_f1, "best_run_id": best_run_id, "data_version": data_version}
+    (ROOT / "metrics.json").write_text(json.dumps(metrics_out, indent=2))
+    log.info(f"metrics.json written")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gold-version", default=None, help="e.g. v1, v2")
+    args = parser.parse_args()
+    run_training(gold_version=args.gold_version)

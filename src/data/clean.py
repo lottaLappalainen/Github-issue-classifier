@@ -1,136 +1,116 @@
 """
-clean.py — Silver Layer
-Reads raw Bronze JSON files, cleans and normalises them,
-assigns a single priority label per issue, and saves as CSV.
+src/data/clean.py  —  Silver Layer
+Cleans Bronze issues: deduplicates, assigns priority labels, fills nulls.
+
+Usage:
+    python src/data/clean.py
 """
-
-import json
-import pandas as pd
+import logging
 from pathlib import Path
+from typing import Optional
 
-BRONZE_DIR = Path("data/bronze")
-SILVER_DIR = Path("data/silver")
-OUTPUT_FILE = SILVER_DIR / "issues_clean.csv"
+import pandas as pd
 
-# ── Label mapping ─────────────────────────────────────────────────────────────
-# Maps GitHub label names → our priority classes.
-# High beats medium beats low if multiple labels match.
+# ── paths ──────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[2]
+BRONZE_PATH = ROOT / "data" / "bronze" / "issues_raw.parquet"
+SILVER_DIR  = ROOT / "data" / "silver"
+SILVER_DIR.mkdir(parents=True, exist_ok=True)
 
-LABEL_MAP = {
-    "high": [
-        "bug", "critical", "priority:high", "severity:high",
-        "Priority: High", "type: bug", "kind/bug",
-    ],
-    "medium": [
-        "enhancement", "feature", "priority:medium",
-        "Priority: Medium", "type: enhancement", "kind/feature",
-    ],
-    "low": [
-        "documentation", "good first issue", "priority:low",
-        "Priority: Low", "help wanted", "type: documentation",
-    ],
-}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
 
-PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+# ── label maps ─────────────────────────────────────────────────────────────
+HIGH_KEYWORDS   = {"bug", "critical", "crash", "priority:high", "severity:high",
+                   "security", "regression", "blocker", "urgent"}
+MEDIUM_KEYWORDS = {"enhancement", "feature", "feature-request", "priority:medium",
+                   "improvement", "performance", "request"}
+LOW_KEYWORDS    = {"documentation", "docs", "good first issue", "help wanted",
+                   "priority:low", "question", "wontfix", "duplicate"}
 
 
-def assign_priority(labels: list[dict]) -> str | None:
+# ── public helpers (imported by tests) ─────────────────────────────────────
+
+def assign_priority(labels_str: str) -> Optional[str]:
     """
-    Given a list of GitHub label objects, return the highest priority class.
-    Returns None if no relevant label is found.
+    Map a comma-separated GitHub labels string to high / medium / low.
+    Returns None if no known label is found.
     """
-    label_names = [l["name"].lower() for l in labels]
-    assigned = []
-
-    for priority, keywords in LABEL_MAP.items():
-        if any(k.lower() in label_names for k in keywords):
-            assigned.append(priority)
-
-    if not assigned:
+    if not labels_str or not labels_str.strip():
         return None
 
-    # Return the highest priority found
-    return min(assigned, key=lambda p: PRIORITY_ORDER[p])
+    labels = {lbl.strip().lower() for lbl in labels_str.split(",")}
+
+    if labels & HIGH_KEYWORDS:
+        return "high"
+    if labels & MEDIUM_KEYWORDS:
+        return "medium"
+    if labels & LOW_KEYWORDS:
+        return "low"
+    return None
 
 
-def clean_text(text: str | None) -> str:
-    """Basic text cleaning — strip whitespace, handle nulls."""
-    if not text:
-        return ""
-    return " ".join(text.strip().split())
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bronze → Silver transformation.
+    - Deduplicates on (repo, number)
+    - Fills null bodies with ""
+    - Drops empty titles
+    - Assigns priority labels
+    - Drops rows with no assignable priority
+    - Creates combined `text` column
+    """
+    log.info(f"  input rows: {len(df):,}")
+
+    # 1. Deduplicate
+    df = df.drop_duplicates(subset=["repo", "number"]).copy()
+    log.info(f"  after dedup: {len(df):,}")
+
+    # 2. Fill nulls
+    df["body"]  = df["body"].fillna("").str.strip()
+    df["title"] = df["title"].fillna("").str.strip()
+
+    # 3. Drop empty titles
+    df = df[df["title"] != ""]
+    log.info(f"  after dropping empty titles: {len(df):,}")
+
+    # 4. Assign priority
+    df["priority"] = df["labels"].apply(assign_priority)
+
+    # 5. Drop unlabelled rows
+    df = df[df["priority"].notna()].copy()
+    log.info(f"  after dropping unlabelled: {len(df):,}")
+
+    # 6. Create combined text field
+    df["text"] = (df["title"] + " " + df["body"]).str.strip()
+
+    log.info(f"  priority distribution:\n{df['priority'].value_counts().to_string()}")
+    return df.reset_index(drop=True)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def save_silver(df: pd.DataFrame, path: Path) -> None:
+    """Write Silver dataframe to parquet."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+    log.info(f"  saved {len(df):,} rows → {path}")
 
-def main():
-    print("🔄 Starting Silver cleaning...")
 
-    bronze_files = list(BRONZE_DIR.glob("*.json"))
-    if not bronze_files:
-        print("❌ No bronze files found. Run ingest.py first.")
-        return
+# ── main ───────────────────────────────────────────────────────────────────
 
-    all_rows = []
+def main() -> None:
+    log.info("=== Silver Layer: Cleaning ===")
 
-    for filepath in bronze_files:
-        print(f"  Processing {filepath.name}...")
+    if not BRONZE_PATH.exists():
+        raise FileNotFoundError(f"Bronze file not found: {BRONZE_PATH}\nRun ingest.py first.")
 
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    df = pd.read_parquet(BRONZE_PATH)
+    log.info(f"Loaded {len(df):,} rows from Bronze")
 
-        repo = data["repo"]
-        fetched_at = data["fetched_at"]
-
-        for issue in data["issues"]:
-            priority = assign_priority(issue.get("labels", []))
-
-            if priority is None:
-                continue  # skip issues we can't label
-
-            title = clean_text(issue.get("title"))
-            body = clean_text(issue.get("body"))
-
-            # Skip if title is empty (unusable)
-            if not title:
-                continue
-
-            all_rows.append({
-                "id":           issue["number"],
-                "repo":         repo,
-                "title":        title,
-                "body":         body[:2000],  # cap body length
-                "priority":     priority,
-                "state":        issue.get("state", ""),
-                "created_at":   issue.get("created_at", ""),
-                "fetched_at":   fetched_at,
-                "label_names":  ", ".join(l["name"] for l in issue.get("labels", [])),
-            })
-
-    df = pd.DataFrame(all_rows)
-
-    # Remove duplicates (same repo + issue number)
-    before = len(df)
-    df = df.drop_duplicates(subset=["repo", "id"])
-    after = len(df)
-    if before != after:
-        print(f"  Removed {before - after} duplicates")
-
-    # Print class distribution so we can spot imbalance
-    print()
-    print("  Class distribution:")
-    dist = df["priority"].value_counts()
-    for label, count in dist.items():
-        pct = count / len(df) * 100
-        print(f"    {label:8s}: {count:5d} ({pct:.1f}%)")
-
-    # Save
-    SILVER_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_csv(OUTPUT_FILE, index=False)
-
-    print()
-    print(f"✅ Silver cleaning complete.")
-    print(f"   Total issues: {len(df)}")
-    print(f"   Output: {OUTPUT_FILE.resolve()}")
+    silver = clean(df)
+    out_path = SILVER_DIR / "issues_clean.parquet"
+    save_silver(silver, out_path)
+    log.info(f"\nDone. {len(silver):,} clean issues saved to {out_path}")
 
 
 if __name__ == "__main__":

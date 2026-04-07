@@ -1,0 +1,196 @@
+name: MLOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  # Also run when data files change (DVC tracked)
+  workflow_dispatch:
+    inputs:
+      retrain:
+        description: 'Force model retrain'
+        required: false
+        default: 'false'
+
+env:
+  PYTHON_VERSION: "3.10"
+  MLFLOW_TRACKING_URI: "mlruns"
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Lint + Tests (runs on every push)
+  # ─────────────────────────────────────────────
+  test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov flake8
+
+      - name: Lint with flake8
+        run: |
+          # Stop on syntax errors or undefined names
+          flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Warn on style issues (don't fail)
+          flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
+
+      - name: Run unit tests with coverage
+        run: |
+          python -m pytest tests/ -v \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            -x
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Train & Evaluate (runs on main only)
+  # ─────────────────────────────────────────────
+  train:
+    name: Train & Evaluate Model
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Set up DVC
+        run: |
+          pip install dvc dvc-gdrive
+          dvc --version
+
+      - name: Fetch GitHub issues (Bronze layer)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python src/data/ingest.py
+        continue-on-error: false
+
+      - name: Clean data (Silver layer)
+        run: python src/data/clean.py
+
+      - name: Featurize (Gold layer)
+        run: python src/data/featurize.py
+
+      - name: Train models and log to MLflow
+        run: python src/models/train.py
+
+      - name: Run inference on test.csv
+        run: |
+          if [ -f "data/test.csv" ]; then
+            python src/models/evaluate.py --input data/test.csv --output data/predictions.csv
+            echo "=== Predictions Preview ==="
+            head -20 data/predictions.csv
+          else
+            echo "No test.csv found — skipping production inference step"
+          fi
+
+      - name: Check model quality gate
+        run: |
+          python - <<'EOF'
+          import json, sys
+          from pathlib import Path
+
+          # Load the latest run metrics
+          metrics_file = Path("metrics.json")
+          if not metrics_file.exists():
+              print("No metrics.json found — skipping quality gate")
+              sys.exit(0)
+
+          metrics = json.loads(metrics_file.read_text())
+          f1 = metrics.get("f1_macro", 0)
+          print(f"F1 macro: {f1:.4f}")
+
+          THRESHOLD = 0.60
+          if f1 < THRESHOLD:
+              print(f"FAIL: F1 {f1:.4f} below threshold {THRESHOLD}")
+              sys.exit(1)
+          else:
+              print(f"PASS: F1 {f1:.4f} above threshold {THRESHOLD}")
+          EOF
+
+      - name: Upload MLflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-runs
+          path: mlruns/
+          retention-days: 30
+
+      - name: Upload predictions
+        uses: actions/upload-artifact@v4
+        with:
+          name: predictions
+          path: data/predictions.csv
+          if-no-files-found: ignore
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: models/best_model.joblib
+          if-no-files-found: warn
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Build & push Docker image (main only, after train passes)
+  # ─────────────────────────────────────────────
+  docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: train
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download trained model
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: models/
+
+      - name: Build Docker image
+        run: |
+          docker build -t github-issue-classifier:${{ github.sha }} .
+          docker build -t github-issue-classifier:latest .
+
+      - name: Test Docker container starts
+        run: |
+          docker run -d --name test-api \
+            -p 8000:8000 \
+            github-issue-classifier:latest
+          sleep 5
+          curl -f http://localhost:8000/health || echo "Health check failed"
+          docker stop test-api

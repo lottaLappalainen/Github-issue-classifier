@@ -1,0 +1,26 @@
+# Data & ML
+scikit-learn>=1.4.0
+numpy>=1.26.0
+pandas>=2.2.0
+
+# MLflow experiment tracking
+mlflow>=2.13.0
+
+# Feature engineering
+scipy>=1.13.0
+
+# API serving
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+
+# Data versioning
+dvc>=3.50.0
+dvc-s3>=3.2.0
+
+# GitHub API / HTTP
+requests>=2.31.0
+
+# Notebooks
+jupyter>=1.0.0
+ipykernel>=6.29
