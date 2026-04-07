@@ -116,16 +116,26 @@ def startup() -> None:
     meta_path  = ROOT / "metrics.json"
 
     if not model_path.exists():
-        log.warning(f"No model found at {model_path} — run train.py first.")
-        return
+        # Fail fast with a clear message rather than starting in a broken state.
+        # The Dockerfile does NOT bake the model in — it must be volume-mounted.
+        # If it isn't there, /predict will return 503 and /health will return 503,
+        # which makes docker-compose health checks and CI smoke tests fail visibly.
+        raise RuntimeError(
+            f"Model not found at {model_path}.\n"
+            "Mount the models/ directory via docker-compose volumes, or run:\n"
+            "  python src/models/train.py"
+        )
 
     pipeline = joblib.load(model_path)
     log.info(f"Model loaded ✓  ({model_path})")
 
     if meta_path.exists():
         model_meta = json.loads(meta_path.read_text())
-        log.info(f"Model meta: F1={model_meta.get('f1_macro')}  "
-                 f"version={model_meta.get('data_version')}")
+        log.info(
+            f"Model meta: F1={model_meta.get('f1_macro')}  "
+            f"data_version={model_meta.get('data_version')}  "
+            f"registry_version={model_meta.get('registry_version', 'unregistered')}"
+        )
 
     _init_db()
 
@@ -159,12 +169,14 @@ class PredictionResponse(BaseModel):
 @app.get("/")
 def root():
     return {
-        "service":      "GitHub Issue Priority Classifier",
-        "status":       "running" if pipeline is not None else "model not loaded",
-        "f1_macro":     model_meta.get("f1_macro"),
-        "data_version": model_meta.get("data_version"),
-        "docs":         "/docs",
-        "prediction_log": str(PRED_LOG_DB),
+        "service":          "GitHub Issue Priority Classifier",
+        "status":           "running" if pipeline is not None else "model not loaded",
+        "f1_macro":         model_meta.get("f1_macro"),
+        "data_version":     model_meta.get("data_version"),
+        "registry_version": model_meta.get("registry_version"),
+        "registry_name":    model_meta.get("registry_name"),
+        "docs":             "/docs",
+        "prediction_log":   str(PRED_LOG_DB),
     }
 
 
