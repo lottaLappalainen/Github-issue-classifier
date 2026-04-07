@@ -2,7 +2,7 @@ name: MLOps CI/CD Pipeline
 
 on:
   push:
-    branches: ["**"]        # run on ALL branch pushes
+    branches: ["**"]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -18,18 +18,16 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────
-  # JOB 1: Lint + Tests  (every push, every branch)
+  # JOB 1: Lint + Tests  (every push)
   # ─────────────────────────────────────────────
   test:
     name: Lint & Unit Tests
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -53,8 +51,7 @@ jobs:
             --cov-report=xml:coverage.xml \
             -x
 
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: coverage.xml
@@ -68,11 +65,9 @@ jobs:
     needs: test
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
@@ -93,54 +88,94 @@ jobs:
       - name: Featurize (Gold layer)
         run: python src/data/featurize.py
 
+      # ── Drift monitoring ───────────────────────────────────────────────
+      # First run: creates baseline_meta.json + baseline_vocab.json, exits clean.
+      # Subsequent runs: compares against baseline, writes drift_report.json.
       - name: Run drift monitor
-        run: python src/monitoring/monitor.py
+        run: python src/monitoring/monitor.py --text-drift
+
+      # ── Retrain trigger (dry-run in CI) ────────────────────────────────
+      # Reads drift_report.json and logs whether a retrain WOULD be triggered.
+      # --dry-run means it never actually retrains here (train step above
+      # already did that). This step closes the CT loop by making the
+      # trigger decision visible in the CI log as evidence.
+      - name: Check retrain trigger (dry-run)
+        run: |
+          python src/monitoring/retrain_trigger.py --dry-run
+          echo "=== Drift Report ==="
+          cat monitoring/drift_report.json || echo "No drift report yet"
+        continue-on-error: true
 
       - name: Train models and log to MLflow
         run: python src/models/train.py
 
-      - name: Evaluate model
+      # ── Evaluate + version comparison ──────────────────────────────────
+      # Always produces monitoring/version_comparison.json comparing all
+      # MLflow runs across data versions — required assignment evidence.
+      - name: Evaluate model + produce version comparison
         run: python src/models/evaluate.py
 
+      - name: Show version comparison
+        run: |
+          echo "=== Model Version Comparison ==="
+          cat monitoring/version_comparison.json || echo "No comparison yet"
+
+      # ── Quality gate (reads params.yaml ci_threshold) ──────────────────
       - name: Check model quality gate
         run: |
           python - <<'EOF'
-          import json, sys
+          import json, sys, yaml
           from pathlib import Path
 
           metrics_file = Path("metrics.json")
           if not metrics_file.exists():
-              print("No metrics.json found — skipping quality gate")
+              print("No metrics.json — skipping quality gate")
               sys.exit(0)
 
-          metrics   = json.loads(metrics_file.read_text())
-          f1        = metrics.get("f1_macro", 0)
-          THRESHOLD = 0.60
-          print(f"F1 macro: {f1:.4f}  |  Threshold: {THRESHOLD}")
+          metrics = json.loads(metrics_file.read_text())
+          f1      = metrics.get("f1_macro", 0)
 
-          if f1 < THRESHOLD:
-              print(f"FAIL: F1 {f1:.4f} below threshold {THRESHOLD}")
+          # Read threshold from params.yaml so it's version-controlled
+          params_file = Path("params.yaml")
+          threshold = 0.60
+          if params_file.exists():
+              with open(params_file) as pf:
+                  p = yaml.safe_load(pf)
+              threshold = p.get("train", {}).get("ci_threshold", 0.60)
+
+          print(f"F1 macro: {f1:.4f}  |  CI threshold: {threshold}")
+          if f1 < threshold:
+              print(f"FAIL: F1 {f1:.4f} below threshold {threshold}")
               sys.exit(1)
           else:
-              print(f"PASS: F1 {f1:.4f} above threshold {THRESHOLD}")
+              print(f"PASS: F1 {f1:.4f} above threshold {threshold}")
           EOF
 
-      - name: Upload MLflow runs
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: mlflow-runs
           path: mlruns/
           retention-days: 30
 
-      - name: Upload trained model
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: trained-model
           path: models/best_model.joblib
           if-no-files-found: warn
 
-      - name: Upload predictions
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: version-comparison
+          path: monitoring/version_comparison.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drift-report
+          path: monitoring/drift_report.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
         with:
           name: predictions
           path: data/predictions.csv
@@ -155,11 +190,9 @@ jobs:
     needs: train
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download trained model
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: trained-model
           path: models/
@@ -169,7 +202,7 @@ jobs:
           docker build -t github-issue-classifier:${{ github.sha }} .
           docker build -t github-issue-classifier:latest .
 
-      - name: Smoke test — container starts and /health responds
+      - name: Smoke test — /health responds
         run: |
           docker run -d --name test-api \
             -p 8000:8000 \
