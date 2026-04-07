@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models       # hot-swap model without rebuild
+      - ./metrics.json:/app/metrics.json
+    environment:
+      - PYTHONPATH=/app
+
+  mlflow:
+    image: python:3.11-slim
+    working_dir: /mlflow
+    volumes:
+      - ./mlruns:/mlflow/mlruns
+    ports:
+      - "5000:5000"
+    command: >
+      bash -c "pip install mlflow --quiet &&
+               mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri /mlflow/mlruns"
