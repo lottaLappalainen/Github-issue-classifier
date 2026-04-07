@@ -1,8 +1,37 @@
+# params.yaml — single source of truth for all pipeline parameters.
+# DVC reads this file: changing any value here triggers rerun of the
+# affected downstream stages when you run `dvc repro`.
+
 featurize:
-  test_size: 0.2
+  test_size: 0.2          # fraction of Gold data held out for testing
+  random_state: 42        # reproducibility seed for split + balancing
 
 train:
-  max_features: 10000
-  ngram_range: [1, 2]
-  C: 1.0
-  n_estimators: 100
+  # TF-IDF settings (shared across all classifiers)
+  max_features: 10000     # vocabulary size cap
+  ngram_range: [1, 2]     # unigrams + bigrams
+
+  # Logistic Regression sweep
+  logistic_regression:
+    - C: 0.5
+      max_features: 5000
+    - C: 1.0
+      max_features: 10000
+
+  # Random Forest
+  random_forest:
+    n_estimators: 100
+    max_features: 10000
+
+  # Quality gates
+  production_threshold: 0.70   # F1 required to promote to Production
+  ci_threshold: 0.60           # F1 below this fails the CI quality gate
+
+monitor:
+  chi2_p_threshold: 0.05       # label distribution significance level
+  size_drift_threshold: 0.20   # max relative change in n_train
+  balance_ratio_max: 2.0       # max majority/minority class ratio
+  confidence_min: 0.70         # min mean API prediction confidence
+  confidence_window: 100       # number of recent predictions to check
+  vocab_overlap_min: 0.60      # min Jaccard similarity for vocabulary
+  vocab_top_n: 500             # number of top tokens to compare

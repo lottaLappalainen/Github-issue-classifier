@@ -1,11 +1,12 @@
 """
 src/models/train.py  —  Model Training + MLflow Logging + Registry
-Trains 3 classifiers, logs to MLflow, registers the best model in the
-MLflow Model Registry, and promotes it to Production if F1 >= threshold.
+
+Parameters are read from params.yaml (train section) so that DVC can
+detect changes and retrigger this stage automatically.
 
 MLflow Registry lifecycle:
   Staging    → best model from this run, pending validation
-  Production → promoted automatically if F1 >= PRODUCTION_THRESHOLD
+  Production → promoted automatically if F1 >= production_threshold
   Archived   → previous Production models
 
 Usage:
@@ -18,6 +19,7 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
+import yaml
 import joblib
 import mlflow
 import mlflow.sklearn
@@ -34,15 +36,71 @@ from sklearn.model_selection import cross_val_score
 ROOT       = Path(__file__).resolve().parents[2]
 GOLD_DIR   = ROOT / "data" / "gold"
 MODELS_DIR = ROOT / "models"
+PARAMS_PATH = ROOT / "params.yaml"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
-LABEL_ORDER          = ["high", "medium", "low"]
-REGISTRY_NAME        = "github-issue-priority"
-PRODUCTION_THRESHOLD = 0.70
+LABEL_ORDER  = ["high", "medium", "low"]
+REGISTRY_NAME = "github-issue-priority"
 
+
+def _load_params() -> dict:
+    """
+    Load train parameters from params.yaml.
+    Falls back to hardcoded defaults so tests work without the file.
+    """
+    defaults = {
+        "max_features": 10000,
+        "ngram_range": [1, 2],
+        "logistic_regression": [
+            {"C": 0.5, "max_features": 5000},
+            {"C": 1.0, "max_features": 10000},
+        ],
+        "random_forest": {"n_estimators": 100, "max_features": 10000},
+        "production_threshold": 0.70,
+        "ci_threshold": 0.60,
+    }
+    if not PARAMS_PATH.exists():
+        log.warning(f"params.yaml not found — using defaults")
+        return defaults
+    with open(PARAMS_PATH) as f:
+        all_params = yaml.safe_load(f)
+    params = all_params.get("train", defaults)
+    log.info(f"Loaded train params from params.yaml")
+    return params
+
+
+def _build_configs(params: dict) -> list[dict]:
+    """
+    Convert params.yaml train section into the list of classifier
+    configs that the training loop iterates over.
+    """
+    configs = []
+
+    # Logistic Regression variants
+    for lr in params.get("logistic_regression", []):
+        configs.append({
+            "classifier":   "logistic_regression",
+            "C":            lr["C"],
+            "max_features": lr.get("max_features", params.get("max_features", 10000)),
+            "ngram_range":  tuple(params.get("ngram_range", [1, 2])),
+        })
+
+    # Random Forest
+    rf = params.get("random_forest", {})
+    configs.append({
+        "classifier":    "random_forest",
+        "n_estimators":  rf.get("n_estimators", 100),
+        "max_features":  rf.get("max_features", params.get("max_features", 10000)),
+        "ngram_range":   tuple(params.get("ngram_range", [1, 2])),
+    })
+
+    return configs
+
+
+# ── public helpers (imported by tests) ─────────────────────────────────────
 
 def build_pipeline(
     classifier: str = "logistic_regression",
@@ -82,29 +140,25 @@ def compute_metrics(y_true: pd.Series, y_pred: np.ndarray) -> dict:
     }
 
 
-def register_best_model(run_id: str, f1_macro: float, data_version: str) -> Optional[str]:
+def register_best_model(run_id: str, f1_macro: float, data_version: str,
+                         production_threshold: float = 0.70) -> Optional[str]:
     """
-    Register the best run in the MLflow Model Registry and handle
-    staging → production promotion with automatic archiving of the
-    previous Production version.
-
-    This implements the governance workflow from the ModelOps lecture:
-    model lineage is preserved, every version is tagged with its data
-    version and F1, and promotion requires passing the quality gate.
+    Register the best run in the MLflow Model Registry.
+    Promotes to Production if F1 >= production_threshold (read from params.yaml),
+    otherwise leaves in Staging for manual review.
+    Archives the previous Production version automatically.
     """
-    client = MlflowClient()
+    client    = MlflowClient()
     model_uri = f"runs:/{run_id}/model"
     try:
         log.info(f"  Registering run {run_id[:8]} → '{REGISTRY_NAME}'")
         mv      = mlflow.register_model(model_uri=model_uri, name=REGISTRY_NAME)
         version = mv.version
 
-        # Tag for full traceability (data version ↔ model version)
         client.set_model_version_tag(REGISTRY_NAME, version, "data_version", data_version)
         client.set_model_version_tag(REGISTRY_NAME, version, "f1_macro",     str(round(f1_macro, 4)))
 
-        if f1_macro >= PRODUCTION_THRESHOLD:
-            # Archive previous Production versions
+        if f1_macro >= production_threshold:
             for old in client.get_latest_versions(REGISTRY_NAME, stages=["Production"]):
                 log.info(f"  Archiving previous Production v{old.version}")
                 client.transition_model_version_stage(
@@ -114,18 +168,20 @@ def register_best_model(run_id: str, f1_macro: float, data_version: str) -> Opti
             client.transition_model_version_stage(
                 name=REGISTRY_NAME, version=version, stage="Production",
             )
-            log.info(f"  ✅ v{version} → Production  (F1={f1_macro:.4f} ≥ {PRODUCTION_THRESHOLD})")
+            log.info(f"  ✅ v{version} → Production  (F1={f1_macro:.4f} ≥ {production_threshold})")
         else:
             client.transition_model_version_stage(
                 name=REGISTRY_NAME, version=version, stage="Staging",
             )
-            log.info(f"  ⚠️  v{version} → Staging  (F1={f1_macro:.4f} < {PRODUCTION_THRESHOLD})")
+            log.info(f"  ⚠️  v{version} → Staging  (F1={f1_macro:.4f} < {production_threshold})")
 
         return version
     except Exception as exc:
         log.warning(f"  Registry step failed (non-fatal): {exc}")
         return None
 
+
+# ── main training loop ─────────────────────────────────────────────────────
 
 def run_training(gold_version: Optional[str] = None) -> None:
     log.info("=== Model Training ===")
@@ -142,14 +198,15 @@ def run_training(gold_version: Optional[str] = None) -> None:
     X_train, y_train = train_df["text"], train_df["priority"]
     X_test,  y_test  = test_df["text"],  test_df["priority"]
 
+    # ── Read params from params.yaml ───────────────────────────────────────
+    params               = _load_params()
+    configs              = _build_configs(params)
+    production_threshold = params.get("production_threshold", 0.70)
+    log.info(f"Running {len(configs)} classifier configs from params.yaml")
+    log.info(f"Production threshold: {production_threshold}")
+
     mlflow.set_experiment("github-issue-priority")
     data_version = gold_version or "v1"
-
-    configs = [
-        {"classifier": "logistic_regression", "C": 0.5,  "max_features": 5_000},
-        {"classifier": "logistic_regression", "C": 1.0,  "max_features": 10_000},
-        {"classifier": "random_forest",       "n_estimators": 100, "max_features": 10_000},
-    ]
 
     best_f1 = -1.0; best_model = None; best_run_id = None
 
@@ -166,7 +223,8 @@ def run_training(gold_version: Optional[str] = None) -> None:
             trained  = train_model(pipeline, X_train, y_train)
 
             cv_scores = cross_val_score(
-                build_pipeline(**cfg), X_train, y_train, cv=3, scoring="f1_macro", n_jobs=-1
+                build_pipeline(**cfg), X_train, y_train,
+                cv=3, scoring="f1_macro", n_jobs=-1,
             )
             mlflow.log_metric("cv_f1_macro_mean", float(cv_scores.mean()))
             mlflow.log_metric("cv_f1_macro_std",  float(cv_scores.std()))
@@ -193,15 +251,19 @@ def run_training(gold_version: Optional[str] = None) -> None:
     log.info(f"\nBest model → {best_path}  (F1={best_f1:.4f}, run={best_run_id})")
 
     registry_version = register_best_model(
-        run_id=best_run_id, f1_macro=best_f1, data_version=data_version
+        run_id=best_run_id,
+        f1_macro=best_f1,
+        data_version=data_version,
+        production_threshold=production_threshold,
     )
 
     metrics_out = {
-        "f1_macro":         best_f1,
-        "best_run_id":      best_run_id,
-        "data_version":     data_version,
-        "registry_version": registry_version,
-        "registry_name":    REGISTRY_NAME,
+        "f1_macro":           best_f1,
+        "best_run_id":        best_run_id,
+        "data_version":       data_version,
+        "registry_version":   registry_version,
+        "registry_name":      REGISTRY_NAME,
+        "production_threshold": production_threshold,
     }
     (ROOT / "metrics.json").write_text(json.dumps(metrics_out, indent=2))
     log.info("metrics.json written")

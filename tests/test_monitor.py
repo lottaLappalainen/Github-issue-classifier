@@ -11,11 +11,15 @@ from src.monitoring.monitor import (
     check_new_data_version,
     check_prediction_confidence,
     run_monitoring,
-    CHI2_P_THRESHOLD,
-    SIZE_DRIFT_THRESHOLD,
-    BALANCE_RATIO_MAX,
-    CONFIDENCE_MIN,
+    build_vocab_baseline,
+    check_text_drift,
 )
+
+# Thresholds now live in params.yaml — use the same defaults here
+CHI2_P_THRESHOLD     = 0.05
+SIZE_DRIFT_THRESHOLD = 0.20
+BALANCE_RATIO_MAX    = 2.0
+CONFIDENCE_MIN       = 0.70
 
 
 # ── fixtures ───────────────────────────────────────────────────────────────
@@ -73,87 +77,87 @@ def _make_pred_db(tmp_path, confidences):
 # ── check_class_distribution ──────────────────────────────────────────────
 
 def test_no_distribution_drift(stable_meta):
-    result = check_class_distribution(stable_meta, stable_meta)
+    result = check_class_distribution(stable_meta, stable_meta, CHI2_P_THRESHOLD)
     assert result["drift_detected"] is False
 
 
 def test_distribution_drift_detected(stable_meta, drifted_meta):
-    result = check_class_distribution(stable_meta, drifted_meta)
+    result = check_class_distribution(stable_meta, drifted_meta, CHI2_P_THRESHOLD)
     assert result["drift_detected"] is True
 
 
 def test_distribution_result_has_required_keys(stable_meta):
-    result = check_class_distribution(stable_meta, stable_meta)
+    result = check_class_distribution(stable_meta, stable_meta, CHI2_P_THRESHOLD)
     for key in ("chi2_stat", "p_value", "threshold", "drift_detected", "baseline_dist", "current_dist"):
         assert key in result
 
 
 def test_distribution_p_value_range(stable_meta):
-    result = check_class_distribution(stable_meta, stable_meta)
+    result = check_class_distribution(stable_meta, stable_meta, CHI2_P_THRESHOLD)
     assert 0.0 <= result["p_value"] <= 1.0
 
 
 def test_distribution_threshold_value(stable_meta):
-    result = check_class_distribution(stable_meta, stable_meta)
+    result = check_class_distribution(stable_meta, stable_meta, CHI2_P_THRESHOLD)
     assert result["threshold"] == CHI2_P_THRESHOLD
 
 
 def test_distribution_missing_class_in_current(stable_meta):
     current = dict(stable_meta)
     current["class_distribution"] = {"high": 5000, "medium": 2000}
-    result = check_class_distribution(stable_meta, current)
+    result = check_class_distribution(stable_meta, current, CHI2_P_THRESHOLD)
     assert result["drift_detected"] is True
 
 
 # ── check_dataset_size ────────────────────────────────────────────────────
 
 def test_no_size_drift(stable_meta):
-    assert check_dataset_size(stable_meta, stable_meta)["drift_detected"] is False
+    assert check_dataset_size(stable_meta, stable_meta, SIZE_DRIFT_THRESHOLD)["drift_detected"] is False
 
 
 def test_size_drift_large_increase(stable_meta):
     current = dict(stable_meta, n_train=20_000)
-    assert check_dataset_size(stable_meta, current)["drift_detected"] is True
+    assert check_dataset_size(stable_meta, current, SIZE_DRIFT_THRESHOLD)["drift_detected"] is True
 
 
 def test_size_drift_large_decrease(stable_meta):
     current = dict(stable_meta, n_train=100)
-    assert check_dataset_size(stable_meta, current)["drift_detected"] is True
+    assert check_dataset_size(stable_meta, current, SIZE_DRIFT_THRESHOLD)["drift_detected"] is True
 
 
 def test_size_drift_small_change(stable_meta):
     current = dict(stable_meta, n_train=7100)
-    assert check_dataset_size(stable_meta, current)["drift_detected"] is False
+    assert check_dataset_size(stable_meta, current, SIZE_DRIFT_THRESHOLD)["drift_detected"] is False
 
 
 def test_size_drift_relative_change_computed(stable_meta):
     current = dict(stable_meta, n_train=stable_meta["n_train"] * 2)
-    result = check_dataset_size(stable_meta, current)
+    result = check_dataset_size(stable_meta, current, SIZE_DRIFT_THRESHOLD)
     assert abs(result["relative_change"] - 1.0) < 0.01
 
 
 def test_size_drift_threshold_key(stable_meta):
-    assert check_dataset_size(stable_meta, stable_meta)["threshold"] == SIZE_DRIFT_THRESHOLD
+    assert check_dataset_size(stable_meta, stable_meta, SIZE_DRIFT_THRESHOLD)["threshold"] == SIZE_DRIFT_THRESHOLD
 
 
 # ── check_class_balance ───────────────────────────────────────────────────
 
 def test_balanced_classes_no_drift(stable_meta):
-    assert check_class_balance(stable_meta)["drift_detected"] is False
+    assert check_class_balance(stable_meta, BALANCE_RATIO_MAX)["drift_detected"] is False
 
 
 def test_imbalanced_classes_drift(drifted_meta):
-    assert check_class_balance(drifted_meta)["drift_detected"] is True
+    assert check_class_balance(drifted_meta, BALANCE_RATIO_MAX)["drift_detected"] is True
 
 
 def test_zero_count_class_fires(stable_meta):
     meta = dict(stable_meta)
     meta["class_distribution"] = {"high": 5000, "medium": 2000, "low": 0}
-    assert check_class_balance(meta)["drift_detected"] is True
+    assert check_class_balance(meta, BALANCE_RATIO_MAX)["drift_detected"] is True
 
 
 def test_balance_ratio_threshold(stable_meta):
-    assert check_class_balance(stable_meta)["threshold"] == BALANCE_RATIO_MAX
+    assert check_class_balance(stable_meta, BALANCE_RATIO_MAX)["threshold"] == BALANCE_RATIO_MAX
 
 
 # ── check_new_data_version ────────────────────────────────────────────────
@@ -447,8 +451,9 @@ def test_register_best_model_tags_version(tmp_path):
 
 
 def test_register_best_model_promotes_to_production_when_f1_high():
-    from src.models.train import register_best_model, PRODUCTION_THRESHOLD
+    from src.models.train import register_best_model
     from unittest.mock import patch, MagicMock
+    PRODUCTION_THRESHOLD = 0.70
 
     mock_mv     = MagicMock(); mock_mv.version = "5"
     mock_client = MagicMock()
@@ -463,8 +468,9 @@ def test_register_best_model_promotes_to_production_when_f1_high():
 
 
 def test_register_best_model_leaves_in_staging_when_f1_low():
-    from src.models.train import register_best_model, PRODUCTION_THRESHOLD
+    from src.models.train import register_best_model
     from unittest.mock import patch, MagicMock
+    PRODUCTION_THRESHOLD = 0.70
 
     mock_mv     = MagicMock(); mock_mv.version = "2"
     mock_client = MagicMock()
@@ -480,8 +486,9 @@ def test_register_best_model_leaves_in_staging_when_f1_low():
 
 
 def test_register_best_model_archives_previous_production():
-    from src.models.train import register_best_model, PRODUCTION_THRESHOLD
+    from src.models.train import register_best_model
     from unittest.mock import patch, MagicMock
+    PRODUCTION_THRESHOLD = 0.70
 
     mock_mv     = MagicMock(); mock_mv.version = "4"
     mock_client = MagicMock()

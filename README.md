@@ -2,7 +2,7 @@
 
 ![CI/CD](https://github.com/lottaLappalainen/github-issue-classifier/actions/workflows/train.yml/badge.svg)
 
-An end-to-end MLOps pipeline that automatically classifies GitHub issues as **high / medium / low** priority using NLP. Covers the full lifecycle: data ingestion, cleaning, feature engineering, model training, experiment tracking, REST API serving, and CI/CD automation.
+An end-to-end MLOps pipeline that automatically classifies GitHub issues as **high / medium / low** priority using NLP. Covers the full lifecycle: data ingestion, cleaning, feature engineering, model training, experiment tracking, drift monitoring, automatic retraining, REST API serving with prediction logging, MLflow Model Registry governance, and CI/CD automation.
 
 Built as part of the MLOps Course at Tampere University 2026.
 
@@ -21,15 +21,22 @@ GitHub REST API (18 repos)
         │
         ▼
 [Gold Layer]    ── combined text, class-balanced, train/test split
-        │
+        │  └── meta.json (gold_version, silver_hash, class distribution)
         ▼
-[Model Training] ── TF-IDF + sklearn classifiers, MLflow tracking
-        │
+[Drift Monitor] ── 6 checks: label drift, size drift, balance drift,
+        │           version change, confidence drift, vocabulary drift
+        │           → monitoring/drift_report.json
         ▼
-[FastAPI Service] ── /predict endpoint, /health, /docs
-        │
+[Retrain Trigger] ── reads drift_report.json, kicks off full pipeline
+        │             if retrain_required = true
         ▼
-[CI/CD] ── GitHub Actions: test → train → quality gate → Docker
+[Model Training] ── TF-IDF + 3 sklearn classifiers, MLflow tracking
+        │            → MLflow Model Registry (Staging → Production)
+        ▼
+[FastAPI Service] ── /predict, /health, /stats, /log
+        │            → every prediction logged to prediction_log.db
+        ▼
+[CI/CD] ── GitHub Actions: lint → test → train → quality gate → Docker
 ```
 
 ---
@@ -38,12 +45,14 @@ GitHub REST API (18 repos)
 
 | Layer | Tool |
 |---|---|
-| Data versioning | DVC (local remote) |
-| ML + tracking | scikit-learn + MLflow |
+| Data versioning | DVC + dvc.lock |
+| ML tracking | scikit-learn + MLflow |
+| Model registry | MLflow Model Registry |
+| Monitoring | Custom chi-square + Jaccard + SQLite |
 | CI/CD | GitHub Actions |
-| Containerization | Docker + docker-compose |
+| Containerisation | Docker + docker-compose |
 | API serving | FastAPI + uvicorn |
-| Data source | GitHub REST API |
+| Data source | GitHub REST API (18 repos) |
 
 ---
 
@@ -53,40 +62,51 @@ GitHub REST API (18 repos)
 github-issue-classifier/
 │
 ├── data/
-│   ├── bronze/             # Raw API data (DVC tracked)
-│   ├── silver/             # Cleaned, labelled data (DVC tracked)
-│   └── gold/               # ML-ready train/test splits (DVC tracked)
+│   ├── bronze/                 # Raw API data (DVC tracked)
+│   ├── silver/                 # Cleaned, labelled (DVC tracked)
+│   └── gold/                   # ML-ready splits + meta.json (DVC tracked)
 │
 ├── src/
 │   ├── data/
-│   │   ├── ingest.py       # GitHub API → Bronze (18 repos)
-│   │   ├── clean.py        # Bronze → Silver (dedup, label, validate)
-│   │   └── featurize.py    # Silver → Gold (text combine, balance, split)
+│   │   ├── ingest.py           # GitHub API → Bronze (18 repos)
+│   │   ├── clean.py            # Bronze → Silver (dedup, label, validate)
+│   │   └── featurize.py        # Silver → Gold (text, balance, split, version)
 │   ├── models/
-│   │   ├── train.py        # Train 3 classifiers, log to MLflow
-│   │   └── evaluate.py     # Evaluate, compare runs, run inference
+│   │   ├── train.py            # Train 3 classifiers, MLflow + Registry
+│   │   └── evaluate.py         # Evaluate, compare runs, run inference
+│   ├── monitoring/
+│   │   ├── monitor.py          # 6-check drift detector → drift_report.json
+│   │   └── retrain_trigger.py  # Reads drift_report, triggers retraining
 │   └── api/
-│       └── serve.py        # FastAPI prediction endpoint
+│       └── serve.py            # FastAPI: /predict /health /stats /log
+│
+├── monitoring/
+│   ├── baseline_meta.json      # Gold metadata snapshot (drift baseline)
+│   ├── baseline_vocab.json     # Top-500 token baseline (vocabulary drift)
+│   ├── drift_report.json       # Latest drift check results
+│   └── prediction_log.db       # SQLite log of every API prediction
 │
 ├── tests/
 │   ├── conftest.py
-│   ├── test_ingest.py      # 20 tests — API mocking, parsing, parquet
-│   ├── test_clean.py       # 30 tests — labelling, dedup, cleaning
-│   ├── test_featurize.py   # 25 tests — text combine, balance, split
-│   ├── test_model.py       # 25 tests — pipeline, training, persistence
-│   └── test_evaluate.py    # 20 tests — metrics, inference, quality gate
+│   ├── test_ingest.py          # 35 tests
+│   ├── test_clean.py           # 46 tests
+│   ├── test_featurize.py       # 38 tests
+│   ├── test_model.py           # 46 tests
+│   ├── test_evaluate.py        # 38 tests
+│   ├── test_monitor.py         # 38 tests — drift checks + registry
+│   └── test_retrain_trigger.py # 30 tests
 │
-├── .github/
-│   └── workflows/
-│       └── train.yml       # CI/CD: lint → test → train → docker
-│
+├── .github/workflows/train.yml  # CI/CD: all jobs run on every push
 ├── Dockerfile
 ├── docker-compose.yml
-├── dvc.yaml                # DVC pipeline (5 stages)
-├── params.yaml             # Hyperparameters tracked by DVC
-├── requirements.txt
-└── README.md
+├── dvc.yaml                     # Pipeline: ingest→clean→featurize→monitor→train→evaluate
+├── dvc.lock                     # Committed version snapshot
+├── params.yaml                  # Tracked hyperparameters
+├── metrics.json                 # Latest F1, run ID, registry version
+└── requirements.txt
 ```
+
+**Total test coverage: 289 tests across 7 files.**
 
 ---
 
@@ -103,7 +123,7 @@ pip install -r requirements.txt
 ### 2. Set your GitHub token
 
 **Windows CMD:**
-```bat
+```cmd
 set GITHUB_TOKEN=your_token_here
 ```
 
@@ -112,18 +132,19 @@ set GITHUB_TOKEN=your_token_here
 export GITHUB_TOKEN=your_token_here
 ```
 
-A token is required to avoid GitHub API rate limits (60 req/hr unauthenticated vs 5000/hr authenticated). Generate one at [github.com/settings/tokens](https://github.com/settings/tokens) — no scopes needed for public repos.
+Generate a token at [github.com/settings/tokens](https://github.com/settings/tokens) — no scopes needed for public repos.
 
 ### 3. Run the full pipeline
 
 ```bash
-# Option A: DVC (recommended — tracks versions automatically)
+# Option A: DVC (recommended — tracks all versions automatically)
 dvc repro
 
 # Option B: Manual step by step
 python src/data/ingest.py
 python src/data/clean.py
 python src/data/featurize.py
+python src/monitoring/monitor.py
 python src/models/train.py
 python src/models/evaluate.py
 ```
@@ -131,14 +152,14 @@ python src/models/evaluate.py
 ### 4. Serve the API
 
 ```bash
-# With Docker (recommended)
+# With Docker (recommended — starts API + MLflow UI)
 docker-compose up
 
 # Or directly
 uvicorn src.api.serve:app --reload --port 8000
 ```
 
-API docs available at `http://localhost:8000/docs`
+API docs at `http://localhost:8000/docs` | MLflow UI at `http://localhost:5000`
 
 ### 5. Run tests
 
@@ -152,15 +173,13 @@ python -m pytest tests/ -v
 
 ### Bronze — Raw Ingestion
 
-`src/data/ingest.py` fetches issues from 18 curated public repos via the GitHub REST API. Repos were selected for high issue volume and consistent label discipline across all three priority tiers.
-
-Pull requests are filtered out (GitHub returns them in the `/issues` endpoint). Data is saved as parquet to `data/bronze/issues_raw.parquet`.
+`src/data/ingest.py` fetches issues from 18 curated public repos via the GitHub REST API. Repos were selected for high issue volume and consistent label discipline across all three priority tiers. Pull requests are filtered out at ingestion time.
 
 ```bash
-# Quick test run (3 repos, 5 pages each)
+# Quick run (3 repos, 5 pages)
 python src/data/ingest.py --repos microsoft/vscode facebook/react django/django --pages 5
 
-# Full run (18 repos, 30 pages each — ~10-20 min)
+# Full run (18 repos, 30 pages each — ~15-20 min)
 python src/data/ingest.py
 ```
 
@@ -169,13 +188,10 @@ python src/data/ingest.py
 `src/data/clean.py` transforms Bronze → Silver:
 
 - Deduplicates on `(repo, number)`
-- Fills null bodies with `""`
-- Drops empty titles
-- Maps GitHub labels to `high / medium / low` using an expanded keyword vocabulary covering repo-specific conventions (`kind/bug`, `type:feature`, `p0/p1/p2`, etc.)
+- Fills null bodies, drops empty titles
+- Maps GitHub labels → `high / medium / low` using an expanded keyword vocabulary covering repo-specific conventions (`kind/bug`, `type:feature`, `p0/p1/p2`, `i-prioritize-high`, etc.)
 - Drops issues with no assignable priority
-- Creates combined `text` column (`title + body`)
-
-**Priority mapping (first match wins):**
+- Creates combined `text` column
 
 | Priority | Label examples |
 |---|---|
@@ -187,93 +203,171 @@ python src/data/ingest.py
 
 `src/data/featurize.py` transforms Silver → Gold:
 
-- Combines title (×3 weight) + body into a single `text` field
-- Upsamples minority classes to balance the dataset (prevents majority-class bias)
+- Combines title (×3 weight) + body into a single `text` field — title repetition gives the model a stronger signal on the most important part
+- Upsamples minority classes to balance the dataset
 - Stratified 80/20 train/test split
-- Saves `data/gold/train.parquet`, `data/gold/test.parquet`, `data/gold/meta.json`
+- Saves `train.parquet`, `test.parquet`, and enriched `meta.json`
+
+`meta.json` is the key file for the monitoring system. It records the `gold_version` (auto-incremented: v1, v2, …), a SHA-256 hash of the Silver file, class distribution, and split config. The monitor compares this file against a saved baseline to detect drift.
+
+```bash
+# Auto-increment version
+python src/data/featurize.py
+
+# Explicit version tag
+python src/data/featurize.py --gold-version v2
+```
 
 ---
 
-## Model Training
+## Model Training & MLflow Registry
 
-`src/models/train.py` trains three classifiers and logs all runs to MLflow:
+`src/models/train.py` trains three classifiers and implements the full MLflow Model Registry lifecycle.
+
+### Classifiers trained
 
 | Classifier | Config |
 |---|---|
-| Logistic Regression | C=0.5, max_features=5k |
-| Logistic Regression | C=1.0, max_features=10k |
-| Random Forest | n_estimators=100, max_features=10k |
+| Logistic Regression | C=0.5, TF-IDF 5k features |
+| Logistic Regression | C=1.0, TF-IDF 10k features |
+| Random Forest | 100 estimators, TF-IDF 10k features |
 
-All classifiers use a TF-IDF vectorizer with unigrams + bigrams (`ngram_range=(1,2)`).
+All use TF-IDF with unigrams + bigrams and `sublinear_tf=True`.
 
-For each run, MLflow logs:
-- Parameters (classifier, C, max_features, etc.)
-- Test set metrics (F1 macro, accuracy, per-class F1)
-- 3-fold cross-validation F1 (mean ± std)
-- Full classification report as artifact
-- `data_version` tag linking model → data version
+### MLflow tracking
 
-The best model (by F1 macro) is saved to `models/best_model.joblib` and `metrics.json` is written for the CI/CD quality gate.
+For every run, MLflow logs parameters, test set metrics (F1 macro, accuracy, per-class F1), 3-fold cross-validation F1 (mean ± std), a full classification report artifact, and a `data_version` tag linking the model to the exact Gold dataset version it was trained on.
 
-### View MLflow runs
+### MLflow Model Registry
+
+After training, the best run is registered in the **MLflow Model Registry** under the name `github-issue-priority`. The registry implements governance workflow:
+
+```
+Run logged → Registered as new version
+                    │
+                    ├── F1 ≥ 0.70 → transition to Production
+                    │              (previous Production → Archived)
+                    │
+                    └── F1 < 0.70 → left in Staging for manual review
+```
+
+Each registered version is tagged with `data_version` and `f1_macro` for full traceability — you can see exactly which dataset version produced which model version.
 
 ```bash
-mlflow ui
-# Open http://localhost:5000
+# Train and register
+python src/models/train.py --gold-version v2
+
+# View registry
+mlflow ui   # → http://localhost:5000 → Models tab
+```
+
+### Primary KPI
+**F1 macro** — macro-averaged F1 score across all three classes. Chosen because the classes are balanced after featurization, and macro averaging treats each class equally regardless of size. Target: > 0.70. CI/CD quality gate: > 0.60.
+
+### Secondary KPI
+**Cross-validation F1 stability** (mean ± std over 3 folds) — measures whether the model generalises consistently or overfits to a particular split. A high mean with low std indicates a robust model. Logged to MLflow for every run.
+
+---
+
+## Drift Monitoring
+
+`src/monitoring/monitor.py` runs six checks comparing the current Gold `meta.json` against a saved baseline. The results are written to `monitoring/drift_report.json`. Any check that fires sets `retrain_required: true`.
+
+### The six checks
+
+| Check | What it detects | Method |
+|---|---|---|
+| `class_distribution` | Label distribution shifted | Chi-square test (p < 0.05) |
+| `dataset_size` | Training set grew or shrank significantly | Relative change > 20% |
+| `class_balance` | One class now dominates | Majority/minority ratio > 2.0 |
+| `gold_version` | New data batch ingested | Version string changed |
+| `prediction_confidence` | Model degrading in production | Mean API confidence < 0.70 |
+| `text_vocabulary` | Input feature space shifted | Jaccard similarity < 0.60 |
+
+### Data drift vs concept drift
+
+**Data drift** (input distribution shift) is caught by `text_vocabulary`: if the vocabulary of incoming GitHub issues has changed significantly — for example, a new framework becomes popular and its bug reports use new terminology the model never saw — the top-500 token sets will diverge. Low Jaccard similarity is an early warning that the feature space has changed.
+
+**Concept drift** (input-output relationship shift) is caught by `prediction_confidence`: even when the words are familiar, if the same kinds of issues are now labelled differently by maintainers, the model's softmax probabilities become more uniform. A drop in mean confidence across recent API predictions is a production-side signal that the world has changed in a way the model no longer understands.
+
+```bash
+# Standard run (5 checks)
+python src/monitoring/monitor.py
+
+# Include vocabulary check (requires baseline_vocab.json)
+python src/monitoring/monitor.py --text-drift
+
+# Build vocabulary baseline (run once after first featurize)
+python -c "from src.monitoring.monitor import build_vocab_baseline; build_vocab_baseline()"
+
+# Exit with code 1 if retrain is required (for CI gates)
+python src/monitoring/monitor.py --fail-on-drift
 ```
 
 ---
 
-## Evaluation
+## Automatic Retraining
+
+`src/monitoring/retrain_trigger.py` reads `drift_report.json` and, if `retrain_required` is true, runs the full pipeline automatically:
+
+```
+ingest → clean → featurize → train → evaluate
+```
+
+The new model version is evaluated against the quality gate (F1 ≥ 0.60). If it passes, `baseline_meta.json` is updated to the new Gold version. If it fails, the old model stays in production and the trigger exits with code 1.
 
 ```bash
-# Evaluate best model on Gold test split
-python src/models/evaluate.py
+# Check drift and retrain if needed
+python src/monitoring/retrain_trigger.py
 
-# Run inference on a CSV file
-python src/models/evaluate.py --input data/my_issues.csv --output data/predictions.csv
+# Check only — do not retrain
+python src/monitoring/retrain_trigger.py --dry-run
 
-# Print MLflow run comparison table
-python src/models/evaluate.py --compare-runs
+# Override the version tag
+python src/monitoring/retrain_trigger.py --gold-version v3
 ```
-
-Input CSV format for inference:
-
-```csv
-title,body
-App crashes on startup,Steps to reproduce: delete config and run
-Add dark mode support,Would improve usability
-```
-
-### KPIs
-
-| Metric | Target |
-|---|---|
-| F1 macro | > 0.70 |
-| Training time | < 2 min |
-| CI/CD quality gate | F1 > 0.60 |
 
 ---
 
 ## API Reference
+
+`src/api/serve.py` — every prediction is logged to `monitoring/prediction_log.db` (SQLite) for observability. The monitor reads this database to detect confidence drift.
 
 ### `POST /predict`
 
 ```bash
 curl -X POST http://localhost:8000/predict \
   -H "Content-Type: application/json" \
-  -d '{"title": "App crashes on startup", "body": "Null pointer exception on launch"}'
+  -d '{"title": "App crashes on startup", "body": "Null pointer on launch"}'
 ```
 
-Response:
 ```json
 {
   "priority": "high",
   "confidence": 0.91,
   "probabilities": {"high": 0.91, "medium": 0.07, "low": 0.02},
-  "f1_macro": 0.74
+  "f1_macro": 0.9458,
+  "data_version": "v1"
 }
 ```
+
+### `GET /stats`
+
+Returns a summary of the last 100 predictions — used by `monitor.py` to track confidence drift over time.
+
+```json
+{
+  "n_predictions": 100,
+  "mean_confidence": 0.887,
+  "min_confidence": 0.612,
+  "max_confidence": 0.997,
+  "priority_distribution": {"high": 41, "medium": 35, "low": 24}
+}
+```
+
+### `GET /log?limit=20`
+
+Returns the last N raw prediction rows for debugging.
 
 ### `GET /health`
 
@@ -281,89 +375,61 @@ Returns `{"status": "healthy"}` if model is loaded, `503` otherwise.
 
 ### `GET /`
 
-Returns service info and current model F1 score.
+Returns service info, current model F1, and data version.
 
 ---
 
-## DVC Workflow
+## DVC Pipeline
 
-This project uses DVC with a local remote for data versioning. Each `dvc repro` run is committed as a new data/model version via `dvc.lock`.
-
-### Setup (first time)
+The full pipeline is defined in `dvc.yaml` with five stages: `ingest → clean → featurize → monitor → train → evaluate`. Parameters in `params.yaml` (`test_size`, `max_features`, `ngram_range`, `C`) are tracked — changing a parameter only reruns downstream stages.
 
 ```bash
-dvc init
-dvc remote add -d local_remote /path/to/dvc-storage
-git add .dvc/config
-git commit -m "chore: add local DVC remote"
-```
-
-### Daily workflow
-
-```bash
-# Run the full pipeline
+# Run full pipeline (skips unchanged stages)
 dvc repro
 
-# Push data to local remote
-dvc push
-
-# Commit the version snapshot
+# Commit the new version snapshot
 git add dvc.lock
-git commit -m "data: ingest v2 — added pytorch/pytorch"
+git commit -m "data: Gold v2 — added pytorch/pytorch, drift detected, retrained"
 ```
 
-### Reproduce any version
-
-```bash
-git checkout <commit-hash>
-dvc checkout
-```
-
-### Pipeline stages
-
-```
-ingest → clean → featurize → train → evaluate
-```
-
-Defined in `dvc.yaml`. Parameters tracked in `params.yaml` — changing `test_size` or `C` triggers only the affected downstream stages.
+Each committed `dvc.lock` is a reproducible snapshot of the exact data and model versions. Any previous state can be restored with `git checkout <hash> && dvc checkout`.
 
 ---
 
 ## CI/CD
 
-GitHub Actions runs on every push to `main` or `develop`:
+GitHub Actions runs on every push to every branch — no branch filter. Three sequential jobs:
 
-| Job | Trigger | Steps |
+| Job | Runs when | Steps |
 |---|---|---|
-| `test` | every push | flake8 lint, 100+ pytest tests, coverage report |
-| `train` | main only | ingest → clean → featurize → train → evaluate → quality gate |
-| `docker` | main only, after train | build image, smoke test `/health` |
+| `test` | Every push | flake8 lint, 289 pytest tests, coverage report |
+| `train` | After `test` passes | ingest (3 pages) → clean → featurize → monitor → train → quality gate |
+| `docker` | After `train` passes | Build image, smoke-test `/health` endpoint |
 
-The quality gate fails the pipeline if F1 macro < 0.60, preventing a regression from being deployed.
-
-Add your GitHub token as a repository secret (`GITHUB_TOKEN` is automatic in Actions).
+The quality gate (F1 ≥ 0.60) blocks the Docker build if the model regressed.
 
 ---
 
 ## Docker
 
 ```bash
-# Build and run
 docker-compose up
 
 # Services:
-#   API:    http://localhost:8000
-#   MLflow: http://localhost:5000
+#   API:    http://localhost:8000  (predict, stats, log, health)
+#   MLflow: http://localhost:5000  (experiments, registry)
 ```
 
-The `models/` directory is volume-mounted so you can hot-swap the model without rebuilding the image.
+`models/` and `metrics.json` are volume-mounted so you can hot-swap the model without rebuilding the image.
 
 ---
 
 ## Limitations & Assumptions
 
-- **Label coverage**: Only issues with recognisable priority labels are used (~40-70% of fetched issues depending on repo). Unlabelled issues are dropped.
-- **Label noise**: Priority labels are assigned by repo maintainers with varying consistency. Some repos use `bug` for both trivial and critical issues.
+- **Label coverage**: Only issues with recognisable priority labels are used (~40–70% of fetched issues depending on repo). Unlabelled issues are dropped.
+- **Label noise**: Priority labels are assigned by maintainers with varying consistency. Some repos use `bug` for both trivial and critical issues.
 - **Class balance**: Minority classes are upsampled with replacement, which may cause overfitting on small datasets. A larger fetch (`--pages 30`) mitigates this.
-- **No issue history**: The model uses only title and body text. Comments, reactions, and time-to-close are available in Bronze/Silver but not used in Gold features.
-- **Static model**: The pipeline does not retrain automatically on new data without a manual `dvc repro` or CI/CD trigger.
+- **Concept drift detection**: The confidence-based check is a proxy — it detects that the model is degrading but cannot explain why without labelled production data. True concept drift confirmation requires human review of low-confidence predictions.
+- **Vocabulary drift threshold**: The 0.60 Jaccard threshold is heuristic. Repos with fast-moving terminology (e.g., AI frameworks) may trigger false positives; stable repos (e.g., Linux kernel) may never reach this threshold even with real drift.
+- **Text features only**: Comments, reactions, assignees, milestones, and time-to-close are available in Bronze/Silver but not used in Gold. These could improve precision for the `high` class specifically.
+- **No online learning**: The pipeline retrains from scratch on each trigger. Incremental or online learning would reduce retraining cost on large datasets.
