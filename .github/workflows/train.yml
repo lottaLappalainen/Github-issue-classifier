@@ -2,25 +2,15 @@ name: MLOps CI/CD Pipeline
 
 on:
   push:
-    branches: [main, develop]
+    branches: ["**"]        # run on ALL branch pushes
   pull_request:
-    branches: [main]
-
-  # ── Scheduled: run full pipeline nightly to pick up new GitHub issues ──
-  schedule:
-    - cron: "0 3 * * *"   # 03:00 UTC every day
-
-  # ── Manual trigger with optional force-retrain flag ──────────────────
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       retrain:
-        description: 'Force model retrain regardless of drift check'
+        description: 'Force model retrain'
         required: false
         default: 'false'
-      gold_version:
-        description: 'Gold version tag to use (e.g. v3). Leave blank to auto-increment.'
-        required: false
-        default: ''
 
 env:
   PYTHON_VERSION: "3.10"
@@ -28,7 +18,7 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────
-  # JOB 1: Lint + Tests (runs on every push)
+  # JOB 1: Lint + Tests  (every push, every branch)
   # ─────────────────────────────────────────────
   test:
     name: Lint & Unit Tests
@@ -70,22 +60,12 @@ jobs:
           path: coverage.xml
 
   # ─────────────────────────────────────────────
-  # JOB 2: Build data layers + drift check
-  # Runs on main, scheduled runs, and manual triggers
+  # JOB 2: Train & Evaluate  (every push)
   # ─────────────────────────────────────────────
-  data_and_monitor:
-    name: Data Pipeline + Drift Monitor
+  train:
+    name: Train & Evaluate Model
     runs-on: ubuntu-latest
     needs: test
-    if: >
-      github.ref == 'refs/heads/main' ||
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch'
-
-    outputs:
-      # Passes retrain decision downstream to the train job
-      retrain_required: ${{ steps.drift_check.outputs.retrain_required }}
-      gold_version:     ${{ steps.drift_check.outputs.gold_version }}
 
     steps:
       - name: Checkout code
@@ -101,121 +81,26 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install dvc scipy
-
-      # Restore the monitoring baseline from the previous run so we can
-      # compare against it.  Falls back gracefully if no cache exists yet.
-      - name: Restore monitoring baseline cache
-        uses: actions/cache@v4
-        with:
-          path: monitoring/baseline_meta.json
-          key: monitoring-baseline-${{ github.ref_name }}
-          restore-keys: monitoring-baseline-
 
       - name: Fetch GitHub issues (Bronze layer)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python src/data/ingest.py
+        run: python src/data/ingest.py --pages 3
 
       - name: Clean data (Silver layer)
         run: python src/data/clean.py
 
       - name: Featurize (Gold layer)
-        run: |
-          VERSION="${{ github.event.inputs.gold_version }}"
-          if [ -n "$VERSION" ]; then
-            python src/data/featurize.py --gold-version "$VERSION"
-          else
-            python src/data/featurize.py   # auto-increments
-          fi
+        run: python src/data/featurize.py
 
       - name: Run drift monitor
-        id: drift_check
-        run: |
-          python src/monitoring/monitor.py
-
-          # Parse drift_report.json and expose outputs for downstream jobs
-          RETRAIN=$(python - <<'EOF'
-          import json
-          r = json.loads(open("monitoring/drift_report.json").read())
-          # Force-retrain override from workflow_dispatch
-          force = "${{ github.event.inputs.retrain }}" == "true"
-          print("true" if r["retrain_required"] or force else "false")
-          EOF
-          )
-
-          VERSION=$(python - <<'EOF'
-          import json
-          from pathlib import Path
-          meta = json.loads(Path("data/gold/meta.json").read_text())
-          print(meta.get("gold_version", "v1"))
-          EOF
-          )
-
-          echo "retrain_required=$RETRAIN"  >> "$GITHUB_OUTPUT"
-          echo "gold_version=$VERSION"       >> "$GITHUB_OUTPUT"
-          echo "Drift check result: retrain_required=$RETRAIN, version=$VERSION"
-
-      # Save updated baseline so the next run has something to compare against
-      - name: Save monitoring baseline cache
-        uses: actions/cache@v4
-        with:
-          path: monitoring/baseline_meta.json
-          key: monitoring-baseline-${{ github.ref_name }}
-
-      - name: Upload drift report
-        uses: actions/upload-artifact@v4
-        with:
-          name: drift-report
-          path: monitoring/drift_report.json
-          if-no-files-found: ignore
-
-      - name: Upload Gold data artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: gold-data
-          path: data/gold/
-          retention-days: 7
-
-  # ─────────────────────────────────────────────
-  # JOB 3: Train & Evaluate
-  # Only runs when drift was detected OR retrain forced
-  # ─────────────────────────────────────────────
-  train:
-    name: Train & Evaluate Model
-    runs-on: ubuntu-latest
-    needs: data_and_monitor
-    # Gate: only retrain when drift monitor says so (or force flag is set)
-    if: needs.data_and_monitor.outputs.retrain_required == 'true'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Download Gold data from previous job
-        uses: actions/download-artifact@v4
-        with:
-          name: gold-data
-          path: data/gold/
+        run: python src/monitoring/monitor.py
 
       - name: Train models and log to MLflow
-        run: |
-          python src/models/train.py \
-            --gold-version "${{ needs.data_and_monitor.outputs.gold_version }}"
+        run: python src/models/train.py
 
       - name: Evaluate model
-        run: python src/models/evaluate.py --output data/predictions.csv --compare-runs
+        run: python src/models/evaluate.py
 
       - name: Check model quality gate
         run: |
@@ -228,13 +113,11 @@ jobs:
               print("No metrics.json found — skipping quality gate")
               sys.exit(0)
 
-          metrics = json.loads(metrics_file.read_text())
-          f1      = metrics.get("f1_macro", 0)
-          version = metrics.get("data_version", "unknown")
-          print(f"Gold version : {version}")
-          print(f"F1 macro     : {f1:.4f}")
-
+          metrics   = json.loads(metrics_file.read_text())
+          f1        = metrics.get("f1_macro", 0)
           THRESHOLD = 0.60
+          print(f"F1 macro: {f1:.4f}  |  Threshold: {THRESHOLD}")
+
           if f1 < THRESHOLD:
               print(f"FAIL: F1 {f1:.4f} below threshold {THRESHOLD}")
               sys.exit(1)
@@ -242,12 +125,19 @@ jobs:
               print(f"PASS: F1 {f1:.4f} above threshold {THRESHOLD}")
           EOF
 
-      - name: Upload MLflow artifacts
+      - name: Upload MLflow runs
         uses: actions/upload-artifact@v4
         with:
           name: mlflow-runs
           path: mlruns/
           retention-days: 30
+
+      - name: Upload trained model
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: models/best_model.joblib
+          if-no-files-found: warn
 
       - name: Upload predictions
         uses: actions/upload-artifact@v4
@@ -256,31 +146,13 @@ jobs:
           path: data/predictions.csv
           if-no-files-found: ignore
 
-      - name: Upload model artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: trained-model
-          path: models/best_model.joblib
-          if-no-files-found: warn
-
-      - name: Upload metrics
-        uses: actions/upload-artifact@v4
-        with:
-          name: metrics
-          path: metrics.json
-          if-no-files-found: ignore
-
   # ─────────────────────────────────────────────
-  # JOB 4: Build Docker image (main only, after train passes)
+  # JOB 3: Build Docker image  (every push, after train)
   # ─────────────────────────────────────────────
   docker:
     name: Build Docker Image
     runs-on: ubuntu-latest
     needs: train
-    if: >
-      always() &&
-      github.ref == 'refs/heads/main' &&
-      needs.train.result == 'success'
 
     steps:
       - name: Checkout code
@@ -292,23 +164,16 @@ jobs:
           name: trained-model
           path: models/
 
-      - name: Download metrics
-        uses: actions/download-artifact@v4
-        with:
-          name: metrics
-          path: .
-        continue-on-error: true
-
       - name: Build Docker image
         run: |
           docker build -t github-issue-classifier:${{ github.sha }} .
           docker build -t github-issue-classifier:latest .
 
-      - name: Test Docker container starts
+      - name: Smoke test — container starts and /health responds
         run: |
           docker run -d --name test-api \
             -p 8000:8000 \
             github-issue-classifier:latest
-          sleep 5
-          curl -f http://localhost:8000/health || echo "Health check failed"
+          sleep 8
+          curl -f http://localhost:8000/health && echo "Health check PASSED"
           docker stop test-api

@@ -329,3 +329,168 @@ def test_run_monitoring_has_five_checks(tmp_path, stable_meta):
          patch("src.monitoring.monitor.PRED_LOG_DB",  tmp_path / "nope.db"):
         report = run_monitoring(baseline_path=baseline_file, meta_path=meta_file)
     assert len(report["checks"]) == 5
+
+
+# ── check_text_drift ───────────────────────────────────────────────────────
+
+def _make_silver_parquet(tmp_path, titles, bodies):
+    import pandas as pd
+    df = pd.DataFrame({
+        "title": titles, "body": bodies,
+        "priority": ["high"] * len(titles),
+        "labels": ["bug"] * len(titles),
+        "repo": ["test/repo"] * len(titles),
+        "number": list(range(len(titles))),
+    })
+    path = tmp_path / "issues_clean.parquet"
+    df.to_parquet(path, index=False)
+    return path
+
+
+def test_text_drift_no_baseline_returns_no_drift(tmp_path):
+    from src.monitoring.monitor import check_text_drift
+    silver = _make_silver_parquet(tmp_path, ["bug crash"], ["app crashes"])
+    result = check_text_drift(silver_path=silver, vocab_path=tmp_path / "noexist.json")
+    assert result["drift_detected"] is False
+    assert result["jaccard_similarity"] is None
+
+
+def test_text_drift_identical_data_no_drift(tmp_path):
+    from src.monitoring.monitor import check_text_drift, build_vocab_baseline
+    silver = _make_silver_parquet(tmp_path, ["bug crash app"] * 10, ["crashes on startup"] * 10)
+    vocab  = tmp_path / "vocab.json"
+    build_vocab_baseline(silver_path=silver, vocab_path=vocab)
+    result = check_text_drift(silver_path=silver, vocab_path=vocab)
+    assert result["drift_detected"] is False
+    assert result["jaccard_similarity"] == 1.0
+
+
+def test_text_drift_completely_different_vocab(tmp_path):
+    from src.monitoring.monitor import check_text_drift, build_vocab_baseline
+    baseline_silver = _make_silver_parquet(
+        tmp_path, ["alpha beta gamma delta"] * 20, ["epsilon zeta eta theta"] * 20
+    )
+    vocab = tmp_path / "vocab.json"
+    build_vocab_baseline(silver_path=baseline_silver, vocab_path=vocab)
+
+    # New silver with completely different words
+    new_silver = tmp_path / "new_silver.parquet"
+    import pandas as pd
+    pd.DataFrame({
+        "title": ["xyz abc qrs"] * 20, "body": ["uvw pqr mnop"] * 20,
+        "priority": ["high"] * 20, "labels": ["bug"] * 20,
+        "repo": ["test/repo"] * 20, "number": list(range(20)),
+    }).to_parquet(new_silver, index=False)
+
+    result = check_text_drift(silver_path=new_silver, vocab_path=vocab, min_overlap=0.60)
+    assert result["drift_detected"] is True
+    assert result["jaccard_similarity"] < 0.60
+
+
+def test_text_drift_result_has_required_keys(tmp_path):
+    from src.monitoring.monitor import check_text_drift, build_vocab_baseline
+    silver = _make_silver_parquet(tmp_path, ["bug crash"] * 5, ["app error"] * 5)
+    vocab  = tmp_path / "vocab.json"
+    build_vocab_baseline(silver_path=silver, vocab_path=vocab)
+    result = check_text_drift(silver_path=silver, vocab_path=vocab)
+    for key in ("drift_detected", "jaccard_similarity", "threshold"):
+        assert key in result
+
+
+def test_text_drift_jaccard_between_0_and_1(tmp_path):
+    from src.monitoring.monitor import check_text_drift, build_vocab_baseline
+    silver = _make_silver_parquet(tmp_path, ["bug crash feature"] * 10, ["app error enhancement"] * 10)
+    vocab  = tmp_path / "vocab.json"
+    build_vocab_baseline(silver_path=silver, vocab_path=vocab)
+    result = check_text_drift(silver_path=silver, vocab_path=vocab)
+    assert 0.0 <= result["jaccard_similarity"] <= 1.0
+
+
+def test_build_vocab_baseline_creates_file(tmp_path):
+    from src.monitoring.monitor import build_vocab_baseline
+    silver = _make_silver_parquet(tmp_path, ["bug crash"] * 5, ["app error"] * 5)
+    vocab  = tmp_path / "vocab.json"
+    build_vocab_baseline(silver_path=silver, vocab_path=vocab)
+    assert vocab.exists()
+    tokens = json.loads(vocab.read_text())
+    assert isinstance(tokens, list)
+    assert len(tokens) > 0
+
+
+# ── register_best_model ────────────────────────────────────────────────────
+
+def test_register_best_model_returns_none_on_failure():
+    """If MLflow registry is unavailable, returns None without crashing."""
+    from src.models.train import register_best_model
+    from unittest.mock import patch
+    with patch("src.models.train.mlflow.register_model", side_effect=Exception("no registry")):
+        result = register_best_model("fake-run-id", f1_macro=0.85, data_version="v1")
+    assert result is None
+
+
+def test_register_best_model_tags_version(tmp_path):
+    from src.models.train import register_best_model
+    from unittest.mock import patch, MagicMock
+
+    mock_mv     = MagicMock(); mock_mv.version = "3"
+    mock_client = MagicMock()
+    mock_client.get_latest_versions.return_value = []
+
+    with patch("src.models.train.mlflow.register_model", return_value=mock_mv), \
+         patch("src.models.train.MlflowClient", return_value=mock_client):
+        result = register_best_model("fake-run-id", f1_macro=0.85, data_version="v2")
+
+    assert result == "3"
+    # Should have set data_version tag
+    tag_calls = [str(c) for c in mock_client.set_model_version_tag.call_args_list]
+    assert any("v2" in c for c in tag_calls)
+
+
+def test_register_best_model_promotes_to_production_when_f1_high():
+    from src.models.train import register_best_model, PRODUCTION_THRESHOLD
+    from unittest.mock import patch, MagicMock
+
+    mock_mv     = MagicMock(); mock_mv.version = "5"
+    mock_client = MagicMock()
+    mock_client.get_latest_versions.return_value = []
+
+    with patch("src.models.train.mlflow.register_model", return_value=mock_mv), \
+         patch("src.models.train.MlflowClient", return_value=mock_client):
+        register_best_model("run-id", f1_macro=PRODUCTION_THRESHOLD + 0.1, data_version="v1")
+
+    stage_calls = [str(c) for c in mock_client.transition_model_version_stage.call_args_list]
+    assert any("Production" in c for c in stage_calls)
+
+
+def test_register_best_model_leaves_in_staging_when_f1_low():
+    from src.models.train import register_best_model, PRODUCTION_THRESHOLD
+    from unittest.mock import patch, MagicMock
+
+    mock_mv     = MagicMock(); mock_mv.version = "2"
+    mock_client = MagicMock()
+    mock_client.get_latest_versions.return_value = []
+
+    with patch("src.models.train.mlflow.register_model", return_value=mock_mv), \
+         patch("src.models.train.MlflowClient", return_value=mock_client):
+        register_best_model("run-id", f1_macro=PRODUCTION_THRESHOLD - 0.1, data_version="v1")
+
+    stage_calls = [str(c) for c in mock_client.transition_model_version_stage.call_args_list]
+    assert any("Staging" in c for c in stage_calls)
+    assert not any("Production" in c for c in stage_calls)
+
+
+def test_register_best_model_archives_previous_production():
+    from src.models.train import register_best_model, PRODUCTION_THRESHOLD
+    from unittest.mock import patch, MagicMock
+
+    mock_mv     = MagicMock(); mock_mv.version = "4"
+    mock_client = MagicMock()
+    old_prod    = MagicMock(); old_prod.version = "3"
+    mock_client.get_latest_versions.return_value = [old_prod]
+
+    with patch("src.models.train.mlflow.register_model", return_value=mock_mv), \
+         patch("src.models.train.MlflowClient", return_value=mock_client):
+        register_best_model("run-id", f1_macro=PRODUCTION_THRESHOLD + 0.1, data_version="v2")
+
+    stage_calls = [str(c) for c in mock_client.transition_model_version_stage.call_args_list]
+    assert any("Archived" in c for c in stage_calls)
