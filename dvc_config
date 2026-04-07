@@ -1,0 +1,106 @@
+name: Scheduled Retrain
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # every Monday 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_retrain:
+        description: 'Force retrain even if no drift detected'
+        required: false
+        default: 'false'
+
+env:
+  PYTHON_VERSION: "3.10"
+
+jobs:
+  retrain:
+    name: Drift Check + Conditional Retrain
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install dvc
+
+      - name: Configure DVC remote (DagsHub)
+        env:
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_TOKEN:    ${{ secrets.DAGSHUB_TOKEN }}
+        run: |
+          dvc remote add -d dagshub https://dagshub.com/lottaLappalainen/github-issue-classifier.dvc --force
+          dvc remote modify dagshub auth basic
+          dvc remote modify dagshub user     $DAGSHUB_USERNAME
+          dvc remote modify dagshub password $DAGSHUB_TOKEN
+
+      - name: Configure MLflow tracking URI (DagsHub)
+        env:
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_TOKEN:    ${{ secrets.DAGSHUB_TOKEN }}
+        run: |
+          echo "MLFLOW_TRACKING_URI=https://dagshub.com/lottaLappalainen/github-issue-classifier.mlflow" >> $GITHUB_ENV
+          echo "MLFLOW_TRACKING_USERNAME=$DAGSHUB_USERNAME" >> $GITHUB_ENV
+          echo "MLFLOW_TRACKING_PASSWORD=$DAGSHUB_TOKEN"    >> $GITHUB_ENV
+
+      - name: Fetch fresh GitHub issues (Bronze)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python src/data/ingest.py --pages 5
+
+      - name: Clean (Silver)
+        run: python src/data/clean.py
+
+      - name: Featurize (Gold)
+        run: python src/data/featurize.py
+
+      - name: Run drift monitor
+        run: python src/monitoring/monitor.py --text-drift
+
+      - name: Show drift report
+        run: |
+          echo "=== Drift Report ==="
+          cat monitoring/drift_report.json
+
+      - name: Run retrain trigger
+        run: |
+          if [ "${{ github.event.inputs.force_retrain }}" = "true" ]; then
+            echo "Force retrain requested"
+            python src/models/train.py
+            python src/models/evaluate.py
+          else
+            python src/monitoring/retrain_trigger.py
+          fi
+
+      - name: Push data to DagsHub (DVC)
+        env:
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_TOKEN:    ${{ secrets.DAGSHUB_TOKEN }}
+        run: dvc push
+        continue-on-error: true
+
+      - name: Show results
+        if: always()
+        run: |
+          echo "=== Version Comparison ==="
+          cat monitoring/version_comparison.json 2>/dev/null || echo "No comparison yet"
+          echo "=== metrics.json ==="
+          cat metrics.json 2>/dev/null || echo "No metrics yet"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scheduled-retrain-evidence
+          path: |
+            monitoring/drift_report.json
+            monitoring/version_comparison.json
+            metrics.json
+          retention-days: 90

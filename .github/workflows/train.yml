@@ -18,7 +18,7 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────
-  # JOB 1: Lint + Tests  (every push)
+  # JOB 1: Lint + Tests
   # ─────────────────────────────────────────────
   test:
     name: Lint & Unit Tests
@@ -57,7 +57,7 @@ jobs:
           path: coverage.xml
 
   # ─────────────────────────────────────────────
-  # JOB 2: Train & Evaluate  (every push)
+  # JOB 2: Train & Evaluate
   # ─────────────────────────────────────────────
   train:
     name: Train & Evaluate Model
@@ -76,29 +76,45 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install dvc
 
-      - name: Fetch GitHub issues (Bronze layer)
+      # ── Configure DagsHub as DVC remote ───────────────────────────────
+      - name: Configure DVC remote (DagsHub)
+        env:
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_TOKEN:    ${{ secrets.DAGSHUB_TOKEN }}
+        run: |
+          dvc remote add -d dagshub https://dagshub.com/lottaLappalainen/github-issue-classifier.dvc --force
+          dvc remote modify dagshub auth basic
+          dvc remote modify dagshub user     $DAGSHUB_USERNAME
+          dvc remote modify dagshub password $DAGSHUB_TOKEN
+
+      # ── Configure MLflow → DagsHub tracking ───────────────────────────
+      # DagsHub hosts a free MLflow server per repo — experiments are
+      # visible at https://dagshub.com/lottaLappalainen/github-issue-classifier/experiments
+      - name: Configure MLflow tracking URI (DagsHub)
+        env:
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_TOKEN:    ${{ secrets.DAGSHUB_TOKEN }}
+        run: |
+          echo "MLFLOW_TRACKING_URI=https://dagshub.com/lottaLappalainen/github-issue-classifier.mlflow" >> $GITHUB_ENV
+          echo "MLFLOW_TRACKING_USERNAME=$DAGSHUB_USERNAME" >> $GITHUB_ENV
+          echo "MLFLOW_TRACKING_PASSWORD=$DAGSHUB_TOKEN"    >> $GITHUB_ENV
+
+      - name: Fetch GitHub issues (Bronze)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python src/data/ingest.py --pages 3
 
-      - name: Clean data (Silver layer)
+      - name: Clean (Silver)
         run: python src/data/clean.py
 
-      - name: Featurize (Gold layer)
+      - name: Featurize (Gold)
         run: python src/data/featurize.py
 
-      # ── Drift monitoring ───────────────────────────────────────────────
-      # First run: creates baseline_meta.json + baseline_vocab.json, exits clean.
-      # Subsequent runs: compares against baseline, writes drift_report.json.
       - name: Run drift monitor
         run: python src/monitoring/monitor.py --text-drift
 
-      # ── Retrain trigger (dry-run in CI) ────────────────────────────────
-      # Reads drift_report.json and logs whether a retrain WOULD be triggered.
-      # --dry-run means it never actually retrains here (train step above
-      # already did that). This step closes the CT loop by making the
-      # trigger decision visible in the CI log as evidence.
       - name: Check retrain trigger (dry-run)
         run: |
           python src/monitoring/retrain_trigger.py --dry-run
@@ -109,9 +125,6 @@ jobs:
       - name: Train models and log to MLflow
         run: python src/models/train.py
 
-      # ── Evaluate + version comparison ──────────────────────────────────
-      # Always produces monitoring/version_comparison.json comparing all
-      # MLflow runs across data versions — required assignment evidence.
       - name: Evaluate model + produce version comparison
         run: python src/models/evaluate.py
 
@@ -120,7 +133,6 @@ jobs:
           echo "=== Model Version Comparison ==="
           cat monitoring/version_comparison.json || echo "No comparison yet"
 
-      # ── Quality gate (reads params.yaml ci_threshold) ──────────────────
       - name: Check model quality gate
         run: |
           python - <<'EOF'
@@ -132,14 +144,11 @@ jobs:
               print("No metrics.json — skipping quality gate")
               sys.exit(0)
 
-          metrics = json.loads(metrics_file.read_text())
-          f1      = metrics.get("f1_macro", 0)
-
-          # Read threshold from params.yaml so it's version-controlled
-          params_file = Path("params.yaml")
+          metrics   = json.loads(metrics_file.read_text())
+          f1        = metrics.get("f1_macro", 0)
           threshold = 0.60
-          if params_file.exists():
-              with open(params_file) as pf:
+          if Path("params.yaml").exists():
+              with open("params.yaml") as pf:
                   p = yaml.safe_load(pf)
               threshold = p.get("train", {}).get("ci_threshold", 0.60)
 
@@ -151,11 +160,23 @@ jobs:
               print(f"PASS: F1 {f1:.4f} above threshold {threshold}")
           EOF
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mlflow-runs
-          path: mlruns/
-          retention-days: 30
+      # ── Push data artifacts to DagsHub ────────────────────────────────
+      # Data is too large for git — DVC pushes it to DagsHub storage.
+      # After this step, anyone can run `dvc pull` to get the exact data.
+      - name: Push data to DagsHub (DVC)
+        env:
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+          DAGSHUB_TOKEN:    ${{ secrets.DAGSHUB_TOKEN }}
+        run: |
+          dvc add data/bronze/issues_raw.parquet \
+                   data/silver/issues_clean.parquet \
+                   data/gold/train.parquet \
+                   data/gold/test.parquet \
+                   data/gold/meta.json \
+                   models/best_model.joblib \
+              2>/dev/null || true
+          dvc push
+        continue-on-error: true   # don't fail the pipeline if push has issues
 
       - uses: actions/upload-artifact@v4
         with:
@@ -182,7 +203,7 @@ jobs:
           if-no-files-found: ignore
 
   # ─────────────────────────────────────────────
-  # JOB 3: Build Docker image  (every push, after train)
+  # JOB 3: Build Docker image
   # ─────────────────────────────────────────────
   docker:
     name: Build Docker Image
@@ -205,6 +226,7 @@ jobs:
       - name: Smoke test — /health responds
         run: |
           docker run -d --name test-api \
+            -v $(pwd)/models:/app/models \
             -p 8000:8000 \
             github-issue-classifier:latest
           sleep 8
