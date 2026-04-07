@@ -1,0 +1,108 @@
+schema: '2.0'
+stages:
+  ingest:
+    cmd: python src/data/ingest.py
+    deps:
+    - path: src/data/ingest.py
+      hash: md5
+      md5: fd5e1d2492f785f2599b67b53e92c4ff
+      size: 8527
+    outs:
+    - path: data/bronze/issues_raw.parquet
+      hash: md5
+      md5: 6c1d2791d6f282e71eacf25279bd13f6
+      size: 20482750
+  clean:
+    cmd: python src/data/clean.py
+    deps:
+    - path: data/bronze/issues_raw.parquet
+      hash: md5
+      md5: 6c1d2791d6f282e71eacf25279bd13f6
+      size: 20482750
+    - path: src/data/clean.py
+      hash: md5
+      md5: 5b642edfc7ca71131b53683e8f26db0b
+      size: 4418
+    outs:
+    - path: data/silver/issues_clean.parquet
+      hash: md5
+      md5: e239ded204585d09a86f5c8a0835d9a1
+      size: 9882045
+  featurize:
+    cmd: python src/data/featurize.py
+    deps:
+    - path: data/silver/issues_clean.parquet
+      hash: md5
+      md5: e239ded204585d09a86f5c8a0835d9a1
+      size: 9882045
+    - path: src/data/featurize.py
+      hash: md5
+      md5: f46d2911d51cd55cc28919ad259840c0
+      size: 5833
+    params:
+      params.yaml:
+        featurize.test_size: 0.2
+    outs:
+    - path: data/gold/meta.json
+      hash: md5
+      md5: 6a604a9ba160935f2a0a1d3f142f3c70
+      size: 204
+    - path: data/gold/test.parquet
+      hash: md5
+      md5: a663d5c58232880d94b067b5b3073cd5
+      size: 1864954
+    - path: data/gold/train.parquet
+      hash: md5
+      md5: 3c16c29500bc5815837bb281a4f8e6db
+      size: 7946415
+  train:
+    cmd: python src/models/train.py
+    deps:
+    - path: data/gold/test.parquet
+      hash: md5
+      md5: a663d5c58232880d94b067b5b3073cd5
+      size: 1864954
+    - path: data/gold/train.parquet
+      hash: md5
+      md5: 3c16c29500bc5815837bb281a4f8e6db
+      size: 7946415
+    - path: src/models/train.py
+      hash: md5
+      md5: 6e91e66e0d367dc08c90ad9bbd7d94ab
+      size: 7520
+    params:
+      params.yaml:
+        train.C: 1.0
+        train.max_features: 10000
+        train.ngram_range:
+        - 1
+        - 2
+    outs:
+    - path: metrics.json
+      hash: md5
+      md5: fd5e7f9473a5fd16537516fb4e31dd3e
+      size: 117
+    - path: models/best_model.joblib
+      hash: md5
+      md5: dce9f81cafe78054f90e421ca40b1ad7
+      size: 9428045
+  evaluate:
+    cmd: python src/models/evaluate.py --output data/predictions.csv
+    deps:
+    - path: data/gold/test.parquet
+      hash: md5
+      md5: a663d5c58232880d94b067b5b3073cd5
+      size: 1864954
+    - path: models/best_model.joblib
+      hash: md5
+      md5: dce9f81cafe78054f90e421ca40b1ad7
+      size: 9428045
+    - path: src/models/evaluate.py
+      hash: md5
+      md5: 7208f0458683bf783c8709a19581fd83
+      size: 8661
+    outs:
+    - path: data/predictions.csv
+      hash: md5
+      md5: 1bac55c41104331832087f3c35181a1d
+      size: 4473964
