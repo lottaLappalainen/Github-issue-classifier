@@ -1,7 +1,3 @@
-"""
-Tests for src/data/featurize.py
-Run with: python -m pytest tests/test_featurize.py -v
-"""
 import json
 import pytest
 import pandas as pd

@@ -1,7 +1,3 @@
-"""
-Tests for src/data/ingest.py
-Run with: python -m pytest tests/test_ingest.py -v
-"""
 import os
 import pytest
 import pandas as pd

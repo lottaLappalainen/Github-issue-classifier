@@ -1,7 +1,3 @@
-"""
-Tests for src/data/clean.py
-Run with: python -m pytest tests/test_clean.py -v
-"""
 import pytest
 import pandas as pd
 from pathlib import Path

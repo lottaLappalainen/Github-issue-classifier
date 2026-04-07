@@ -1,8 +1,0 @@
-featurize:
-  test_size: 0.2
-
-train:
-  max_features: 10000
-  ngram_range: [1, 2]
-  C: 1.0
-  n_estimators: 100

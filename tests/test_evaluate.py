@@ -1,7 +1,3 @@
-"""
-Tests for src/models/evaluate.py
-Run with: python -m pytest tests/test_evaluate.py -v
-"""
 import json
 import pytest
 import pandas as pd

@@ -6,13 +6,15 @@ splits train/test, and saves Gold artifacts as parquet.
 Outputs:
     data/gold/train.parquet  — columns: text, priority
     data/gold/test.parquet   — columns: text, priority
-    data/gold/meta.json      — dataset statistics
+    data/gold/meta.json      — dataset statistics + gold_version (used by monitor)
 
 Usage:
     python src/data/featurize.py
     python src/data/featurize.py --silver-path data/silver/issues_clean.parquet
+    python src/data/featurize.py --gold-version v2
 """
 import json
+import hashlib
 import logging
 import argparse
 from pathlib import Path
@@ -101,8 +103,23 @@ def featurize(df: pd.DataFrame, test_size: float = TEST_SIZE) -> tuple[pd.DataFr
     return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
 
-def save_gold(train_df: pd.DataFrame, test_df: pd.DataFrame, gold_dir: Path) -> None:
-    """Save Gold train/test splits and metadata."""
+def _compute_silver_hash(silver_path: Path) -> str:
+    """SHA-256 of the Silver file — used to auto-detect a new data batch."""
+    h = hashlib.sha256()
+    with open(silver_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+
+def save_gold(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    gold_dir: Path,
+    silver_path: Path,
+    gold_version: str,
+) -> None:
+    """Save Gold train/test splits and enriched metadata."""
     gold_dir = Path(gold_dir)
     gold_dir.mkdir(parents=True, exist_ok=True)
 
@@ -114,22 +131,54 @@ def save_gold(train_df: pd.DataFrame, test_df: pd.DataFrame, gold_dir: Path) -> 
     log.info(f"  saved train → {train_path}")
     log.info(f"  saved test  → {test_path}")
 
-    # Write metadata for DVC / MLflow lineage
+    # ── Enriched metadata (monitor.py reads these fields) ─────────────────
     meta = {
+        # versioning
+        "gold_version":       gold_version,
+        "silver_hash":        _compute_silver_hash(silver_path),
+
+        # size
         "n_train":            len(train_df),
         "n_test":             len(test_df),
+
+        # class distribution — used for chi-square drift test
         "class_distribution": train_df["priority"].value_counts().to_dict(),
+
+        # per-class proportions (convenient for reports)
+        "class_proportions":  (
+            train_df["priority"].value_counts(normalize=True).round(4).to_dict()
+        ),
+
+        # split config
         "test_size":          TEST_SIZE,
         "columns":            list(train_df.columns),
     }
     meta_path = gold_dir / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
     log.info(f"  saved meta  → {meta_path}")
+    log.info(f"  gold_version={gold_version}  silver_hash={meta['silver_hash']}")
 
 
 # ── main ───────────────────────────────────────────────────────────────────
 
-def main(silver_path: Path, gold_dir: Path) -> None:
+def _next_version(gold_dir: Path) -> str:
+    """
+    Auto-increment version based on existing meta.json.
+    If no meta exists, start at v1.
+    """
+    meta_path = gold_dir / "meta.json"
+    if not meta_path.exists():
+        return "v1"
+    try:
+        existing = json.loads(meta_path.read_text())
+        v = existing.get("gold_version", "v0")
+        n = int(v.lstrip("v"))
+        return f"v{n + 1}"
+    except (ValueError, KeyError):
+        return "v1"
+
+
+def main(silver_path: Path, gold_dir: Path, gold_version: str = None) -> None:
     log.info("=== Gold Layer: Featurization ===")
 
     if not silver_path.exists():
@@ -141,15 +190,24 @@ def main(silver_path: Path, gold_dir: Path) -> None:
     log.info(f"Loaded {len(df):,} rows from Silver")
 
     train_df, test_df = featurize(df)
-    save_gold(train_df, test_df, gold_dir)
 
-    log.info(f"\nDone. Gold data saved to {gold_dir.resolve()}")
+    # Determine version: explicit arg > auto-increment
+    version = gold_version or _next_version(gold_dir)
+
+    save_gold(train_df, test_df, gold_dir, silver_path, version)
+    log.info(f"\nDone. Gold data saved to {gold_dir.resolve()}  (version={version})")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Featurize Silver → Gold layer")
-    parser.add_argument("--silver-path", type=Path, default=SILVER_PATH)
-    parser.add_argument("--gold-dir",    type=Path, default=GOLD_DIR)
+    parser.add_argument("--silver-path",   type=Path, default=SILVER_PATH)
+    parser.add_argument("--gold-dir",      type=Path, default=GOLD_DIR)
+    parser.add_argument("--gold-version",  type=str,  default=None,
+                        help="Explicit version tag e.g. v2 (auto-increments if omitted)")
     args = parser.parse_args()
 
-    main(silver_path=args.silver_path, gold_dir=args.gold_dir)
+    main(
+        silver_path=args.silver_path,
+        gold_dir=args.gold_dir,
+        gold_version=args.gold_version,
+    )

@@ -1,7 +1,3 @@
-"""
-Tests for src/models/train.py
-Run with: python -m pytest tests/test_model.py -v
-"""
 import pytest
 import numpy as np
 import pandas as pd

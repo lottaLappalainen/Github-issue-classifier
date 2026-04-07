@@ -28,12 +28,26 @@ stages:
       - params.yaml:
           - featurize.test_size
 
+  # ── NEW: drift monitoring runs after every featurize ──────────────────
+  # Writes monitoring/drift_report.json.
+  # Does NOT block the pipeline — train reads drift_report.json itself
+  # and the CI/CD workflow decides whether to proceed.
+  monitor:
+    cmd: python src/monitoring/monitor.py
+    deps:
+      - src/monitoring/monitor.py
+      - data/gold/meta.json          # re-runs whenever Gold changes
+    outs:
+      - monitoring/drift_report.json:
+          cache: false               # always written fresh, not DVC-cached
+
   train:
     cmd: python src/models/train.py
     deps:
       - src/models/train.py
       - data/gold/train.parquet
       - data/gold/test.parquet
+      - monitoring/drift_report.json # train depends on monitor completing
     outs:
       - models/best_model.joblib
     metrics:
