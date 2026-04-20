@@ -27,15 +27,17 @@ def get_next_version(metrics_path=METRICS_PATH):
 
 def run_retrain(gold_version):
     log.info(f"Triggering retrain for gold_version={gold_version}")
+    import os
+    env = os.environ.copy()   
     steps = [
-        ["python", "src/data/ingest.py"],
+        ["python", "src/data/ingest.py", "--pages", "5"],
         ["python", "src/data/clean.py"],
         ["python", "src/data/featurize.py"],
         ["python", "src/models/train.py", "--gold-version", gold_version],
         ["python", "src/models/evaluate.py"],
     ]
     for cmd in steps:
-        result = subprocess.run(cmd, cwd=ROOT, capture_output=False)
+        result = subprocess.run(cmd, cwd=ROOT, capture_output=False, env=env)
         if result.returncode != 0:
             log.error(f"Step failed: {' '.join(cmd)}")
             return False
