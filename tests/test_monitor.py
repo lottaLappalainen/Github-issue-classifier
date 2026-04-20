@@ -457,14 +457,14 @@ def test_register_best_model_promotes_to_production_when_f1_high():
 
     mock_mv     = MagicMock(); mock_mv.version = "5"
     mock_client = MagicMock()
-    mock_client.get_latest_versions.return_value = []
+    mock_client.get_model_version_by_alias.side_effect = Exception("no alias")
 
     with patch("src.models.train.mlflow.register_model", return_value=mock_mv), \
          patch("src.models.train.MlflowClient", return_value=mock_client):
         register_best_model("run-id", f1_macro=PRODUCTION_THRESHOLD + 0.1, data_version="v1")
 
-    stage_calls = [str(c) for c in mock_client.transition_model_version_stage.call_args_list]
-    assert any("Production" in c for c in stage_calls)
+    alias_calls = [str(c) for c in mock_client.set_registered_model_alias.call_args_list]
+    assert any("production" in c for c in alias_calls)
 
 
 def test_register_best_model_leaves_in_staging_when_f1_low():
@@ -474,15 +474,15 @@ def test_register_best_model_leaves_in_staging_when_f1_low():
 
     mock_mv     = MagicMock(); mock_mv.version = "2"
     mock_client = MagicMock()
-    mock_client.get_latest_versions.return_value = []
+    mock_client.get_model_version_by_alias.side_effect = Exception("no alias")
 
     with patch("src.models.train.mlflow.register_model", return_value=mock_mv), \
          patch("src.models.train.MlflowClient", return_value=mock_client):
         register_best_model("run-id", f1_macro=PRODUCTION_THRESHOLD - 0.1, data_version="v1")
 
-    stage_calls = [str(c) for c in mock_client.transition_model_version_stage.call_args_list]
-    assert any("Staging" in c for c in stage_calls)
-    assert not any("Production" in c for c in stage_calls)
+    alias_calls = [str(c) for c in mock_client.set_registered_model_alias.call_args_list]
+    assert any("staging" in c for c in alias_calls)
+    assert not any("production" in c for c in alias_calls)
 
 
 def test_register_best_model_archives_previous_production():
@@ -493,11 +493,11 @@ def test_register_best_model_archives_previous_production():
     mock_mv     = MagicMock(); mock_mv.version = "4"
     mock_client = MagicMock()
     old_prod    = MagicMock(); old_prod.version = "3"
-    mock_client.get_latest_versions.return_value = [old_prod]
+    mock_client.get_model_version_by_alias.return_value = old_prod
 
     with patch("src.models.train.mlflow.register_model", return_value=mock_mv), \
          patch("src.models.train.MlflowClient", return_value=mock_client):
         register_best_model("run-id", f1_macro=PRODUCTION_THRESHOLD + 0.1, data_version="v2")
 
-    stage_calls = [str(c) for c in mock_client.transition_model_version_stage.call_args_list]
-    assert any("Archived" in c for c in stage_calls)
+    alias_calls = [str(c) for c in mock_client.set_registered_model_alias.call_args_list]
+    assert any("archived" in c for c in alias_calls)

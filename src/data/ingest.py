@@ -33,12 +33,10 @@ DEFAULT_REPOS = [
     "microsoft/vscode",           # ~180k issues, excellent label discipline
     "microsoft/TypeScript",       # strong bug / enhancement split
     "golang/go",                  # priority labels, very clean
-    "rust-lang/rust",             # I-prioritize-high / I-enhancement etc.
     "kubernetes/kubernetes",      # priority/critical-urgent labels
     "ansible/ansible",            # bug / feature / docs well used
 
     # ── Enhancement / feature heavy ──
-    "facebook/react",             # enhancement, feature-request
     "vuejs/vue",                  # feature labels
     "sveltejs/svelte",            # enhancement-heavy
     "vitejs/vite",                # feature requests well labelled

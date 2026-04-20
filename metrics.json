@@ -1,8 +1,8 @@
 {
   "f1_macro": 0.9548655944565648,
-  "best_run_id": "8702bb71db65479e99e3332772b226bd",
+  "best_run_id": "9d968c5af4f14fd2bdfe98c6eac7fca5",
   "data_version": "v1",
-  "registry_version": 1,
+  "registry_version": 2,
   "registry_name": "github-issue-priority",
   "production_threshold": 0.7
 }

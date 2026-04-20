@@ -159,21 +159,21 @@ def register_best_model(run_id: str, f1_macro: float, data_version: str,
         client.set_model_version_tag(REGISTRY_NAME, version, "f1_macro",     str(round(f1_macro, 4)))
 
         if f1_macro >= production_threshold:
-            for old in client.get_latest_versions(REGISTRY_NAME, stages=["Production"]):
-                log.info(f"  Archiving previous Production v{old.version}")
-                client.transition_model_version_stage(
-                    name=REGISTRY_NAME, version=old.version,
-                    stage="Archived", archive_existing_versions=False,
+            # Archive previous production version by renaming its alias
+            try:
+                prev = client.get_model_version_by_alias(REGISTRY_NAME, "production")
+                client.delete_registered_model_alias(REGISTRY_NAME, "production")
+                client.set_registered_model_alias(
+                    REGISTRY_NAME, f"archived-v{prev.version}", prev.version
                 )
-            client.transition_model_version_stage(
-                name=REGISTRY_NAME, version=version, stage="Production",
-            )
-            log.info(f"  ✅ v{version} → Production  (F1={f1_macro:.4f} ≥ {production_threshold})")
+                log.info(f"  Archived previous production v{prev.version}")
+            except Exception:
+                pass  # No previous production version exists yet
+            client.set_registered_model_alias(REGISTRY_NAME, "production", version)
+            log.info(f"  ✅ v{version} → alias:production  (F1={f1_macro:.4f} ≥ {production_threshold})")
         else:
-            client.transition_model_version_stage(
-                name=REGISTRY_NAME, version=version, stage="Staging",
-            )
-            log.info(f"  ⚠️  v{version} → Staging  (F1={f1_macro:.4f} < {production_threshold})")
+            client.set_registered_model_alias(REGISTRY_NAME, "staging", version)
+            log.info(f"  ⚠️  v{version} → alias:staging  (F1={f1_macro:.4f} < {production_threshold})")
 
         return version
     except Exception as exc:

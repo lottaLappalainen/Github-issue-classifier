@@ -1,14 +1,12 @@
 name: Scheduled Retrain
 
 on:
-  push:
-    branches: ["**"]
-  pull_request:
-    branches: [main, master]
+  schedule:
+    - cron: "0 6 * * 1"   
   workflow_dispatch:
     inputs:
-      retrain:
-        description: 'Try retrain flow'
+      force_retrain:
+        description: 'Force retrain even if no drift detected'
         required: false
         default: 'false'
 
