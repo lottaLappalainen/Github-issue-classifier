@@ -1,5 +1,59 @@
 {
-  "status": "baseline_created",
-  "retrain_required": false,
-  "checks": {}
+  "status": "drift_detected",
+  "retrain_required": true,
+  "checks": {
+    "class_distribution": {
+      "chi2_stat": 0.0,
+      "p_value": 1.0,
+      "threshold": 0.05,
+      "drift_detected": false,
+      "baseline_dist": {
+        "high": 2332,
+        "medium": 2332,
+        "low": 2332
+      },
+      "current_dist": {
+        "low": 147,
+        "high": 147,
+        "medium": 147
+      }
+    },
+    "dataset_size": {
+      "baseline_n_train": 6996,
+      "current_n_train": 441,
+      "relative_change": 0.937,
+      "threshold": 0.2,
+      "drift_detected": true
+    },
+    "class_balance": {
+      "imbalance_ratio": 1.0,
+      "threshold": 2.0,
+      "drift_detected": false,
+      "class_counts": {
+        "low": 147,
+        "high": 147,
+        "medium": 147
+      }
+    },
+    "gold_version": {
+      "baseline_version": "unknown",
+      "current_version": "v1",
+      "new_batch_detected": true
+    },
+    "prediction_confidence": {
+      "drift_detected": false,
+      "mean_confidence": null,
+      "threshold": 0.7,
+      "n_predictions": 0,
+      "note": "prediction_log.db not found yet"
+    },
+    "text_vocabulary": {
+      "drift_detected": false,
+      "jaccard_similarity": 0.6639,
+      "baseline_vocab_size": 500,
+      "current_vocab_size": 500,
+      "overlap_tokens": 399,
+      "threshold": 0.6
+    }
+  }
 }
