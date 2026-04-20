@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from src.features.text_features import combine_issue_text_single
 from pydantic import BaseModel
 
 # ── paths ──────────────────────────────────────────────────────────────────
@@ -192,8 +193,8 @@ def predict(issue: IssueRequest):
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Model not loaded — run train.py first")
 
-    # Same text combination as featurize.py (title weighted 3x)
-    text = (issue.title + " ") * 3 + issue.body
+    # Shared text combination — guaranteed identical to featurize.py
+    text = combine_issue_text_single(issue.title, issue.body)
 
     priority   = pipeline.predict([text])[0]
     proba_dict = {}

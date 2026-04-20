@@ -23,6 +23,7 @@ from pathlib import Path
 
 import yaml
 import pandas as pd
+from src.features.text_features import combine_issue_text, TITLE_WEIGHT
 from sklearn.model_selection import train_test_split
 from sklearn.utils import resample
 
@@ -59,11 +60,10 @@ def _load_params() -> dict:
 def combine_text(df: pd.DataFrame) -> pd.Series:
     """
     Combine title + body into a single text field.
-    Title is repeated 3x to give it more weight than body.
+    Delegates to src.features.text_features.combine_issue_text so that
+    featurize.py and serve.py always use identical logic (no training-serving skew).
     """
-    title = df["title"].fillna("").str.strip()
-    body  = df["body"].fillna("").str.strip()
-    return (title + " " + title + " " + title + " " + body).str.strip()
+    return combine_issue_text(df["title"], df["body"])
 
 
 def balance_classes(df: pd.DataFrame, random_state: int = 42) -> pd.DataFrame:
