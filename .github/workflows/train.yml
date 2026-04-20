@@ -15,6 +15,7 @@ on:
 env:
   PYTHON_VERSION: "3.10"
   MLFLOW_TRACKING_URI: "mlruns"
+  PYTHONPATH: "."
 
 jobs:
   # ─────────────────────────────────────────────
@@ -91,6 +92,8 @@ jobs:
           dvc remote modify dagshub password $DAGSHUB_TOKEN
 
       # ── Configure MLflow → DagsHub tracking ───────────────────────────
+      # DagsHub hosts a free MLflow server per repo — experiments are
+      # visible at https://dagshub.com/lottaLappalainen/github-issue-classifier/experiments
       - name: Configure MLflow tracking URI (DagsHub)
         env:
           DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
