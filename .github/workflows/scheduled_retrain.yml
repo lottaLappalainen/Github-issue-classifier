@@ -2,7 +2,7 @@ name: Scheduled Retrain
 
 on:
   schedule:
-    - cron: "0 6 * * 1"   # every Monday 06:00 UTC
+    - cron: "0 6 * * 1"   
   workflow_dispatch:
     inputs:
       force_retrain:
@@ -31,6 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install dvc
+          pip install -e .
 
       - name: Configure DVC remote (DagsHub)
         env:

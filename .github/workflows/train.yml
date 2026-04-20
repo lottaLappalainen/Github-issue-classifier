@@ -77,6 +77,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install dvc
+          pip install -e .
 
       # ── Configure DagsHub as DVC remote ───────────────────────────────
       - name: Configure DVC remote (DagsHub)
@@ -90,8 +91,6 @@ jobs:
           dvc remote modify dagshub password $DAGSHUB_TOKEN
 
       # ── Configure MLflow → DagsHub tracking ───────────────────────────
-      # DagsHub hosts a free MLflow server per repo — experiments are
-      # visible at https://dagshub.com/lottaLappalainen/github-issue-classifier/experiments
       - name: Configure MLflow tracking URI (DagsHub)
         env:
           DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
